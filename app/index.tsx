@@ -1,20 +1,22 @@
 // app/index.tsx
-// Audio por tramos + variantes Repairing, Gen_start al iniciar (0%→>0%),
-// y al COMPLETAR: loop de Generator_Completed + notificación one-shot simultánea.
+// Audio por tramos + variantes Repairing (sin Gen_start).
+// - Histeresis "repairingSmooth" para ignorar taps rápidos.
+// - Retención mínima de pista para evitar cambios nerviosos.
+// - Al completar: loop de Generator_Completed + notificación one-shot.
+// - Reset: silencio total.
 
-import type { AVPlaybackStatus } from "expo-av";
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
 import { useKeepAwake } from "expo-keep-awake";
 import React, { useEffect, useRef, useState } from "react";
 import {
-  GestureResponderEvent,
-  Pressable,
-  SafeAreaView,
-  StatusBar,
-  StyleSheet,
-  Text,
-  View,
+	GestureResponderEvent,
+	Pressable,
+	SafeAreaView,
+	StatusBar,
+	StyleSheet,
+	Text,
+	View,
 } from "react-native";
 
 // ==== Parámetros del juego ====
@@ -25,21 +27,19 @@ const MAX_PLAYER_REPAIR_PENALTY = 0.7;
 
 // ==== Audio ====
 const VOL = 0.7;
-const XFADE_MS = 160;       // duración del crossfade
-const START_LEAD_MS = 140;  // cuánto antes de acabar Gen_start lanzamos la pista destino
+const XFADE_MS = 160; // duración del crossfade
 
 const SFX = {
-	start: require("../../assets/sfx/Gen_start.wav"),
-	gen1: require("../../assets/sfx/Gen1.wav"),
-	gen1Repair: require("../../assets/sfx/Gen1_Repairing.wav"),
-	gen2: require("../../assets/sfx/Gen2.wav"),
-	gen2Repair: require("../../assets/sfx/Gen2_Repairing.wav"),
-	gen3: require("../../assets/sfx/Gen3.wav"),
-	gen3Repair: require("../../assets/sfx/Gen3_Repairing.wav"),
-	gen4: require("../../assets/sfx/Gen4.wav"),
-	gen4Repair: require("../../assets/sfx/Gen4_Repairing.wav"),
-	completed: require("../../assets/sfx/Generator_Completed.wav"),
-	completedNotif: require("../../assets/sfx/Generator_Completed_Notification.wav"),
+	gen1: require("../assets/sfx/Gen1.wav"),
+	gen1Repair: require("../assets/sfx/Gen1_Repairing.wav"),
+	gen2: require("../assets/sfx/Gen2.wav"),
+	gen2Repair: require("../assets/sfx/Gen2_Repairing.wav"),
+	gen3: require("../assets/sfx/Gen3.wav"),
+	gen3Repair: require("../assets/sfx/Gen3_Repairing.wav"),
+	gen4: require("../assets/sfx/Gen4.wav"),
+	gen4Repair: require("../assets/sfx/Gen4_Repairing.wav"),
+	completed: require("../assets/sfx/Generator_Completed.wav"),
+	completedNotif: require("../assets/sfx/Generator_Completed_Notification.wav"),
 } as const;
 
 type TrackKey = keyof typeof SFX;
@@ -77,9 +77,16 @@ export default function Engine() {
 	const currentRef = useRef<Audio.Sound | null>(null);
 	const stoppingRef = useRef(false);
 
-	// Para Gen_start sólo en 0%→>0% con repairing
-	const prevProgressRef = useRef(0);
-	const startPlayedThisRunRef = useRef(false);
+	// ==== Histeresis para "repairing" ====
+	const REPAIRING_ON_DELAY_MS = 120;
+	const REPAIRING_OFF_DELAY_MS = 220;
+	const [repairingSmooth, setRepairingSmooth] = useState(false);
+	const onTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const offTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+	// Retención mínima de pista para evitar cambios muy seguidos
+	const MIN_TRACK_HOLD_MS = 250;
+	const lastSwitchRef = useRef(0);
 
 	useEffect(() => {
 		Audio.setAudioModeAsync({
@@ -132,115 +139,100 @@ export default function Engine() {
 	const triggerComplete = async () => {
 		setIsComplete(true);
 		try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
-
-		// 1) Crossfade al loop de "completed"
 		await crossfadeTo("completed");
-
-		// 2) Reproduce encima la notificación one-shot (no interrumpe el loop)
 		await playCompletedNotificationOnce();
 	};
 
-	// Reproduce la notificación de completado una sola vez
+	// Histeresis repairingSmooth (suaviza taps rápidos)
+	useEffect(() => {
+		const raw = playersTouching > 0;
+
+		// Limpiar timers previos
+		if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
+		if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
+
+		if (raw) {
+			// Entrar a repairing tras pequeña espera
+			if (!repairingSmooth) {
+				onTimerRef.current = setTimeout(() => {
+					setRepairingSmooth(true);
+					onTimerRef.current = null;
+				}, REPAIRING_ON_DELAY_MS);
+			}
+		} else {
+			// Salir de repairing tras espera un poco mayor
+			if (repairingSmooth) {
+				offTimerRef.current = setTimeout(() => {
+					setRepairingSmooth(false);
+					offTimerRef.current = null;
+				}, REPAIRING_OFF_DELAY_MS);
+			}
+		}
+
+		return () => {
+			if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
+			if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
+		};
+	}, [playersTouching, repairingSmooth]);
+
+	// Notificación de completado una sola vez
 	const playCompletedNotificationOnce = async () => {
 		const s = soundsRef.current.completedNotif;
 		if (!s) return;
 		try {
 			await s.setIsLoopingAsync(false);
-			await s.setVolumeAsync(0.95);
+			await s.setVolumeAsync(VOL);
 			await s.setPositionAsync(0);
 			await s.playAsync();
 		} catch {}
 	};
 
-	// Pista de loop por rango (Gen_start va aparte)
-	const chooseLoopTrack = (p: number, repairing: boolean): TrackKey => {
+	// Pista a sonar por rango (p=0 → null ⇒ silencio)
+	const chooseLoopTrack = (p: number, repairing: boolean): TrackKey | null => {
+		if (p <= 0) return null; // silencio a 0%
 		if (p > 0 && p <= 0.25) return repairing ? "gen1Repair" : "gen1";
 		if (p > 0.25 && p <= 0.5) return repairing ? "gen2Repair" : "gen2";
 		if (p > 0.5 && p <= 0.75) return repairing ? "gen3Repair" : "gen3";
 		if (p > 0.75 && p < 1) return repairing ? "gen4Repair" : "gen4";
-		return currentKeyRef.current ?? "gen4";
+		return null;
 	};
 
 	// Observa cambios que afecten a audio
 	useEffect(() => {
 		(async () => {
-			// Si está completo, nos aseguramos de estar en el loop de completed (y no otra pista)
+			// Si está completo, asegúrate de estar en completed
 			if (isComplete) {
 				if (currentKeyRef.current !== "completed") {
 					await crossfadeTo("completed");
 				}
-				prevProgressRef.current = progress;
 				return;
 			}
 
-			const repairing = playersTouching > 0;
-			const prev = prevProgressRef.current;
+			const desired = chooseLoopTrack(progress, repairingSmooth);
 
-			// Gen_start sólo una vez por “carrera”
-			if (!startPlayedThisRunRef.current && prev === 0 && progress > 0 && repairing) {
-				startPlayedThisRunRef.current = true;
-				await playStartThenAutoLead();
-				prevProgressRef.current = progress;
+			// p=0 ⇒ silencio
+			if (!desired) {
+				if (currentRef.current) await crossfadeTo(null);
 				return;
 			}
 
-			// Si suena "start", dejamos que su handler haga el lead
-			if (currentKeyRef.current === "start") {
-				prevProgressRef.current = progress;
-				return;
-			}
-
-			// Mientras no esté completo, elige loop por rango
-			const desired = chooseLoopTrack(progress, repairing);
 			if (desired !== currentKeyRef.current) {
 				await crossfadeTo(desired);
 			}
-
-			prevProgressRef.current = progress;
 		})().catch(() => {});
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [progress, playersTouching, isComplete]);
+		 
+	}, [progress, repairingSmooth, isComplete]);
 
-	// Reproduce Gen_start y hace lead a la pista de rango actual
-	const playStartThenAutoLead = async () => {
-		const start = soundsRef.current.start;
-		if (!start) return;
-
-		// Si hay algo sonando, crossfade a silencio primero
-		if (currentRef.current) await crossfadeTo(null);
-
-		await start.setIsLoopingAsync(false);
-		await start.setVolumeAsync(0);
-		await start.setPositionAsync(0);
-
-		const startHandler = async (status: AVPlaybackStatus) => {
-			if (!status.isLoaded) return;
-			const remaining = (status.durationMillis ?? 0) - (status.positionMillis ?? 0);
-			if (remaining <= START_LEAD_MS) {
-				start.setOnPlaybackStatusUpdate(null);
-				// Si se completara durante el start (raro), prioriza completed
-				if (isComplete) {
-					await crossfadeTo("completed");
-					await playCompletedNotificationOnce();
-					return;
-				}
-				// Calcula destino actual
-				const repairing = playersTouching > 0;
-				const target = chooseLoopTrack(Math.max(progress, 0.0001), repairing);
-				await crossfadeTo(target);
-			}
-		};
-		start.setOnPlaybackStatusUpdate(startHandler);
-
-		currentKeyRef.current = "start";
-		currentRef.current = start;
-		await start.playAsync();
-		await fadeVolume(start, 0, VOL, Math.min(120, XFADE_MS));
-	};
-
-	// Crossfade a nueva pista (o a silencio si key=null)
+	// Crossfade a nueva pista (o a silencio si key=null) con retención mínima
 	const crossfadeTo = async (key: TrackKey | null) => {
 		try {
+			// Retén cambios demasiado seguidos (suaviza flapping)
+			const now = Date.now();
+			if (currentKeyRef.current !== key && now - lastSwitchRef.current < MIN_TRACK_HOLD_MS) {
+				return;
+			}
+			lastSwitchRef.current = now;
+
 			if (stoppingRef.current) return;
 			stoppingRef.current = true;
 
@@ -250,8 +242,7 @@ export default function Engine() {
 			if (key) {
 				next = soundsRef.current[key] ?? null;
 				if (next) {
-					// Todas salvo "start" van en loop
-					const shouldLoop = key !== "start";
+					const shouldLoop = key !== "completedNotif"; // notif nunca por aquí
 					await next.setIsLoopingAsync(shouldLoop);
 					await next.setVolumeAsync(0);
 					await next.setPositionAsync(0);
@@ -272,11 +263,6 @@ export default function Engine() {
 				await fadeVolume(next, 0, VOL, XFADE_MS);
 			}
 
-			// Limpia handler si venimos de start
-			if (currentKeyRef.current === "start" && current) {
-				current.setOnPlaybackStatusUpdate(null);
-			}
-
 			currentRef.current = key ? next : null;
 			currentKeyRef.current = key ?? null;
 		} finally {
@@ -284,21 +270,21 @@ export default function Engine() {
 		}
 	};
 
-	// Reset: silencio total; no suena nada hasta nuevo 0→>0 con players
+	// Reset: silencio total (y limpiar histeresis)
 	const reset = async () => {
 		setProgress(0);
 		setIsComplete(false);
+		setRepairingSmooth(false);
 		try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); } catch {}
 
-		startPlayedThisRunRef.current = false;
-		prevProgressRef.current = 0;
+		// Cancela timers de histeresis
+		if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
+		if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
 
 		// Silencio total
-		if (currentRef.current) {
-			currentRef.current.setOnPlaybackStatusUpdate(null);
-			await crossfadeTo(null);
-		}
-		// Por si la notificación estuviera sonando (raro), la detenemos
+		if (currentRef.current) await crossfadeTo(null);
+
+		// Por si la notificación estuviera sonando (poco probable)
 		if (soundsRef.current.completedNotif) {
 			await soundsRef.current.completedNotif.stopAsync().catch(() => {});
 		}
@@ -309,8 +295,9 @@ export default function Engine() {
 		return () => {
 			(async () => {
 				try {
+					if (onTimerRef.current) { clearTimeout(onTimerRef.current); }
+					if (offTimerRef.current) { clearTimeout(offTimerRef.current); }
 					if (currentRef.current) {
-						currentRef.current.setOnPlaybackStatusUpdate(null);
 						await currentRef.current.stopAsync().catch(() => {});
 					}
 					for (const k of Object.keys(soundsRef.current) as TrackKey[]) {
