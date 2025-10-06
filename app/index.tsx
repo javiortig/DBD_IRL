@@ -1,9 +1,7 @@
 // app/index.tsx
-// Multitouch fluido con hovers precisos (pageX/pageY).
-// Contenido en flujo normal (sin absolutos) -> sin solapes: Título, Jugadores, Barra, %, Hint/OK.
-// Barra visible en Android con composición forzada. Overlay de anillos (pointerEvents: none).
-// Histeresis repairing, retención de pista, audio por tramos, completado con loop + notif.
-// Orientación bloqueada a landscape.
+// Motor (80%) + Zona de Patada (20%).
+// Indicador visual de REGRESIÓN: badge rojo + barra que late en rojo mientras hay regresión.
+// Multitouch fluido, audio por tramos, completado con loop+notif, landscape.
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
@@ -14,7 +12,6 @@ import {
 	AppState,
 	findNodeHandle,
 	GestureResponderEvent,
-	Pressable,
 	SafeAreaView,
 	StatusBar,
 	StyleSheet,
@@ -48,6 +45,7 @@ const SFX = {
 	gen4Repair: require("../assets/sfx/Gen4_Repairing.wav"),
 	completed: require("../assets/sfx/Generator_Completed.wav"),
 	completedNotif: require("../assets/sfx/Generator_Completed_Notification.wav"),
+	break: require("../assets/sfx/Generator_Break.wav"),
 } as const;
 
 type TrackKey = keyof typeof SFX;
@@ -69,11 +67,12 @@ async function fadeVolume(sound: Audio.Sound, from: number, to: number, ms: numb
 export default function Engine() {
 	useKeepAwake();
 
-	// Bloqueo de orientación a horizontal
+	// Bloqueo landscape
 	useEffect(() => {
 		ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE).catch(() => {});
 	}, []);
 
+	// Estado principal
 	const [progress, setProgress] = useState(0); // 0..1
 	const [playersTouching, setPlayersTouching] = useState(0);
 	const [isComplete, setIsComplete] = useState(false);
@@ -82,6 +81,24 @@ export default function Engine() {
 	const rafRef = useRef<number | null>(null);
 	const lastTsRef = useRef<number | null>(null);
 	const basePerSecond = 1 / SOLO_SECONDS;
+
+	// === Regresión tras patada ===
+	const REGRESSION_SPEED_MULT = 0.5; // 50% de la velocidad base de 1 survivor
+	const regressionActiveRef = useRef(false);
+	const [regressionActive, setRegressionActive] = useState(false); // para renderizar UI
+	const regressionRecoverBaselineRef = useRef<number | null>(null);
+	const regressionRecoverAmount = 0.05; // +5%
+
+	// Pulso visual mientras hay regresión
+	const [regPulse, setRegPulse] = useState(false);
+	useEffect(() => {
+		if (regressionActive) {
+			const id = setInterval(() => setRegPulse(p => !p), 450);
+			return () => clearInterval(id);
+		} else {
+			setRegPulse(false);
+		}
+	}, [regressionActive]);
 
 	// Audio
 	const soundsRef = useRef<Partial<Record<TrackKey, Audio.Sound>>>({});
@@ -105,7 +122,7 @@ export default function Engine() {
 	const playersTouchingRef = useRef(0);
 	useEffect(() => { playersTouchingRef.current = playersTouching; }, [playersTouching]);
 
-	// ======= Layout absoluto del área de motor (para convertir pageX/Y a coords locales) =======
+	// ======= Layout absoluto del motor (para convertir pageX/Y a coords locales) =======
 	const engineRef = useRef<View | null>(null);
 	const engineRectRef = useRef<{ x: number; y: number; w: number; h: number }>({ x: 0, y: 0, w: 1, h: 1 });
 
@@ -114,6 +131,8 @@ export default function Engine() {
 		if (!node) return;
 		// @ts-ignore
 		UIManager.measureInWindow?.(node, (x: number, y: number, w: number, h: number) => {
+		  
+
 			engineRectRef.current = { x, y, w: Math.max(1, w), h: Math.max(1, h) };
 		});
 	};
@@ -130,8 +149,6 @@ export default function Engine() {
 		const t = setTimeout(measureEngineInWindow, 0);
 		return () => clearTimeout(t);
 	}, []);
-
-	const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
 
 	useEffect(() => {
 		Audio.setAudioModeAsync({
@@ -159,7 +176,7 @@ export default function Engine() {
 		return () => { mounted = false; };
 	}, []);
 
-	// Progreso
+	// --- Progreso + Regresión ---
 	useEffect(() => {
 		const loop = (ts: number) => {
 			if (!lastTsRef.current) lastTsRef.current = ts;
@@ -168,9 +185,38 @@ export default function Engine() {
 
 			setProgress(prev => {
 				if (isComplete) return prev;
+
+				let next = prev;
+
+				// Reparación
 				const mult = getSpeedMultiplier(playersTouching) * BOOST_PER_EXTRA;
-				const rate = basePerSecond * mult;
-				const next = Math.min(1, prev + rate * dt);
+				const repairRate = basePerSecond * mult;
+
+				// Regresión (si está activa y no hay jugadores)
+				const shouldRegress = regressionActiveRef.current && playersTouching === 0;
+				const regressRate = basePerSecond * REGRESSION_SPEED_MULT;
+
+				if (shouldRegress) {
+					next = Math.max(0, next - regressRate * dt);
+				} else {
+					next = Math.min(1, next + repairRate * dt);
+				}
+
+				// Cancelación de regresión cuando reparan +5% desde que vuelven
+				if (regressionActiveRef.current) {
+					if (playersTouching > 0) {
+						if (regressionRecoverBaselineRef.current === null) {
+							regressionRecoverBaselineRef.current = next;
+						} else {
+							if (next >= regressionRecoverBaselineRef.current + regressionRecoverAmount) {
+								regressionActiveRef.current = false;
+								setRegressionActive(false);
+								regressionRecoverBaselineRef.current = null;
+							}
+						}
+					}
+				}
+
 				if (next >= 1 && !isComplete) triggerComplete();
 				return next;
 			});
@@ -186,6 +232,9 @@ export default function Engine() {
 		clearTouches();
 		clearRepairingTimers();
 		setRepairingSmooth(false);
+		regressionActiveRef.current = false;
+		setRegressionActive(false);
+		regressionRecoverBaselineRef.current = null;
 
 		try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
 		await crossfadeTo("completed");
@@ -239,6 +288,7 @@ export default function Engine() {
 		} catch {}
 	};
 
+	// Elección de pista por tramo
 	const chooseLoopTrack = (p: number, repairing: boolean): TrackKey | null => {
 		if (p <= 0) return null;
 		if (p > 0 && p <= 0.25) return repairing ? "gen1Repair" : "gen1";
@@ -248,6 +298,7 @@ export default function Engine() {
 		return null;
 	};
 
+	// Reaccionar a cambios de progreso/repairing/estado
 	useEffect(() => {
 		(async () => {
 			if (isComplete) {
@@ -267,6 +318,7 @@ export default function Engine() {
 		})().catch(() => {});
 	}, [progress, repairingSmooth, isComplete]);
 
+	// Crossfade genérico
 	const crossfadeTo = async (key: TrackKey | null) => {
 		try {
 			const now = Date.now();
@@ -304,6 +356,8 @@ export default function Engine() {
 				await fadeVolume(next, 0, VOL, XFADE_MS);
 			}
 
+		  
+
 			currentRef.current = key ? next : null;
 			currentKeyRef.current = key ?? null;
 		} finally {
@@ -311,37 +365,7 @@ export default function Engine() {
 		}
 	};
 
-	const reset = async () => {
-		setProgress(0);
-		setIsComplete(false);
-		setRepairingSmooth(false);
-		clearRepairingTimers();
-		clearTouches();
-
-		try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); } catch {}
-		if (currentRef.current) await crossfadeTo(null);
-		if (soundsRef.current.completedNotif) {
-			await soundsRef.current.completedNotif.stopAsync().catch(() => {});
-		}
-	};
-
-	useEffect(() => {
-		return () => {
-			(async () => {
-				try {
-					clearRepairingTimers();
-					if (currentRef.current) {
-						await currentRef.current.stopAsync().catch(() => {});
-					}
-					for (const k of Object.keys(soundsRef.current) as TrackKey[]) {
-						await soundsRef.current[k]?.unloadAsync().catch(() => {});
-					}
-				} catch {}
-			})();
-		};
-	}, []);
-
-	// === Multitouch FLUIDO con pageX/pageY → coords locales del engine ===
+	// ======= Multitouch en motor (izquierda) =======
 	const readAllTouches = (evt?: GestureResponderEvent) => {
 		const touches = (evt?.nativeEvent as any)?.touches ?? [];
 		const { x, y, w, h } = engineRectRef.current;
@@ -389,10 +413,83 @@ export default function Engine() {
 		applyTouches(readAllTouches(evt));
 	};
 
-	const handleGrant = (e: GestureResponderEvent) => updateTouches(e);
-	const handleMove = (e: GestureResponderEvent) => updateTouches(e);
-	const handleRelease = (e: GestureResponderEvent) => { updateTouches(e); postReleaseDoubleCheck(); };
-	const handleTerminate = (_e: GestureResponderEvent) => { clearTouches(); };
+	// ==== ZONA DE PATEAR (derecha 20%) ====
+	const KICK_HOLD_MS = 3000;
+	const [kickHold, setKickHold] = useState(0); // 0..1
+	const kickAnimatingRef = useRef(false);
+	const kickStartTsRef = useRef<number | null>(null);
+	const kickRafRef = useRef<number | null>(null);
+
+	const kickReset = () => {
+		kickAnimatingRef.current = false;
+		kickStartTsRef.current = null;
+		setKickHold(0);
+		if (kickRafRef.current) {
+			cancelAnimationFrame(kickRafRef.current);
+			kickRafRef.current = null;
+		}
+	};
+
+	const kickPlayBreak = async () => {
+		const s = soundsRef.current.break;
+		if (!s) return;
+		try {
+			await s.setIsLoopingAsync(false);
+			await s.setVolumeAsync(VOL);
+			await s.setPositionAsync(0);
+			await s.playAsync();
+		} catch {}
+	};
+
+	const onKickStart = () => {
+		if (isComplete) return;
+		if (kickAnimatingRef.current) return;
+		kickAnimatingRef.current = true;
+		kickStartTsRef.current = Date.now();
+
+		const step = () => {
+			if (!kickAnimatingRef.current) return;
+			const elapsed = Date.now() - (kickStartTsRef.current ?? Date.now());
+			const pct = Math.min(1, elapsed / KICK_HOLD_MS);
+			setKickHold(pct);
+			if (pct >= 1) {
+				// Acción de patada
+				kickAnimatingRef.current = false;
+				kickRafRef.current = null;
+				setKickHold(1);
+
+				// Reproducir sonido break
+				kickPlayBreak().catch(() => {});
+
+				// Aplicar -20% y activar regresión
+				setProgress(prev => Math.max(0, prev - 0.20));
+				regressionActiveRef.current = true;
+				setRegressionActive(true);
+				regressionRecoverBaselineRef.current = null;
+				return;
+			}
+			kickRafRef.current = requestAnimationFrame(step);
+		};
+		kickRafRef.current = requestAnimationFrame(step);
+	};
+
+	const onKickEnd = () => {
+		// si no completó, cancelar y vaciar la barra
+		if (kickAnimatingRef.current) {
+			kickReset();
+		} else {
+			// si completó, limpia visual tras un instante
+			setTimeout(() => setKickHold(0), 120);
+		}
+	};
+
+	// Limpieza
+	useEffect(() => {
+		return () => {
+			if (rafRef.current) cancelAnimationFrame(rafRef.current);
+			if (kickRafRef.current) cancelAnimationFrame(kickRafRef.current);
+		};
+	}, []);
 
 	// Limpia toques si la app se va a background/inactiva
 	useEffect(() => {
@@ -400,6 +497,10 @@ export default function Engine() {
 			if (state !== "active") {
 				clearTouches();
 				setRepairingSmooth(false);
+				kickReset();
+				regressionActiveRef.current = false;
+				setRegressionActive(false);
+				regressionRecoverBaselineRef.current = null;
 				setTimeout(measureEngineInWindow, 0);
 			}
 		});
@@ -411,7 +512,9 @@ export default function Engine() {
 	return (
 		<SafeAreaView style={styles.safe}>
 			<StatusBar hidden />
-			<View style={styles.container}>
+			{/* Layout en fila: motor (80%) + patada (20%) */}
+			<View style={styles.row}>
+                {/* ===== IZQUIERDA: MOTOR ===== */}
 				<View
 					ref={engineRef}
 					style={[styles.engineArea, isComplete && styles.engineComplete]}
@@ -420,10 +523,10 @@ export default function Engine() {
 					pointerEvents={isComplete ? "none" : "auto"}
 					onStartShouldSetResponder={() => !isComplete}
 					onMoveShouldSetResponder={() => !isComplete}
-					onResponderGrant={handleGrant}
-					onResponderMove={handleMove}
-					onResponderRelease={handleRelease}
-					onResponderTerminate={handleTerminate}
+					onResponderGrant={updateTouches}
+					onResponderMove={updateTouches}
+					onResponderRelease={(e) => { updateTouches(e); postReleaseDoubleCheck(); }}
+					onResponderTerminate={() => { clearTouches(); }}
 					onTouchEndCapture={(e) => {
 						const pts = readAllTouches(e);
 						if (pts.length === 0) clearTouches();
@@ -437,9 +540,16 @@ export default function Engine() {
 					accessible
 					accessibilityLabel="Área del motor"
 				>
-					{/* --- CAPA 1: Contenido en flujo normal --- */}
-					<View style={styles.content} pointerEvents="box-none">
+					{/* Contenido en flujo */}
+					<View style={styles.engineContent} pointerEvents="box-none">
 						<Text style={styles.title}>MOTOR</Text>
+
+						{/* Badge de regresión */}
+						{regressionActive && (
+							<View style={styles.regBadge}>
+								<Text style={styles.regBadgeText}>REGRESIÓN</Text>
+							</View>
+						)}
 
 						{!isComplete && (
 							<Text style={styles.players}>
@@ -447,16 +557,18 @@ export default function Engine() {
 							</Text>
 						)}
 
-						{/* Barra en flujo normal (sin absolutos) */}
+						{/* Barra con pulso rojo si hay regresión */}
 						<View
-							style={styles.progressBar}
+							style={[
+								styles.progressBar,
+								regressionActive && (regPulse ? styles.progressBarRegA : styles.progressBarRegB),
+							]}
 							renderToHardwareTextureAndroid
 							needsOffscreenAlphaCompositing
 						>
 							<View style={[styles.progressFill, { width: `${percent}%` }]} />
 						</View>
 
-						{/* % debajo de la barra */}
 						<Text style={styles.percent}>{percent}%</Text>
 
 						{isComplete ? (
@@ -466,7 +578,7 @@ export default function Engine() {
 						)}
 					</View>
 
-					{/* --- CAPA 2: Anillos (encima, sin capturar eventos) --- */}
+					{/* Overlay de anillos */}
 					{!isComplete && (
 						<View style={styles.ringsOverlay} pointerEvents="none">
 							{touchPoints.map(p => (
@@ -476,10 +588,24 @@ export default function Engine() {
 					)}
 				</View>
 
-				<View style={styles.controls}>
-					<Pressable style={[styles.button, styles.primary]} onPress={reset}>
-						<Text style={styles.buttonText}>Reiniciar</Text>
-					</Pressable>
+				{/* ===== DERECHA: PATEAR (ASESINO) ===== */}
+				<View
+					style={[styles.kickArea, isComplete && styles.kickDisabled]}
+					onStartShouldSetResponder={() => !isComplete}
+					onMoveShouldSetResponder={() => !isComplete}
+					onResponderGrant={() => { if (!isComplete) onKickStart(); }}
+					onResponderRelease={onKickEnd}
+					onResponderTerminate={onKickEnd}
+					accessible
+					accessibilityLabel="Zona de patada del asesino"
+				>
+					<Text style={styles.kickTitle}>PATADA</Text>
+					<Text style={styles.kickHint}>Mantén 3s</Text>
+
+					{/* Barra vertical roja de carga */}
+					<View style={styles.kickBar}>
+						<View style={[styles.kickFill, { height: `${Math.round(kickHold * 100)}%` }]} />
+					</View>
 				</View>
 			</View>
 		</SafeAreaView>
@@ -489,14 +615,17 @@ export default function Engine() {
 // ==== Estilos ====
 const styles = StyleSheet.create({
 	safe: { flex: 1, backgroundColor: "#0b0e10" },
-	container: {
+
+	// Layout en dos columnas (landscape)
+	row: {
 		flex: 1,
-		paddingHorizontal: 20,
-		paddingVertical: 16,
-		backgroundColor: "#0b0e10",
+		flexDirection: "row",
 	},
+
+	// ===== Motor (izquierda 80%) =====
 	engineArea: {
 		flex: 1,
+		marginRight: 10,
 		borderRadius: 20,
 		borderWidth: 2,
 		borderColor: "#333",
@@ -505,16 +634,15 @@ const styles = StyleSheet.create({
 		justifyContent: "center",
 		position: "relative",
 		overflow: "hidden",
-		paddingHorizontal: 24, // holgura lateral para landscape
-		paddingVertical: 16,   // holgura vertical para que nada se pise
+		paddingHorizontal: 24,
+		paddingVertical: 16,
 	},
 	engineComplete: { borderColor: "#4ade80", backgroundColor: "#122417" },
 
-	// Contenido en flujo normal y con separación vertical consistente
-	content: {
+	engineContent: {
 		alignItems: "center",
 		justifyContent: "center",
-		gap: 14,        // separación vertical uniforme entre elementos
+		gap: 12,
 		position: "relative",
 		zIndex: 1,
 		width: "100%",
@@ -523,7 +651,23 @@ const styles = StyleSheet.create({
 	title: { color: "#e5e7eb", fontSize: 34, fontWeight: "800", letterSpacing: 2, textAlign: "center" },
 	players: { color: "#9ca3af", fontSize: 18, textAlign: "center" },
 
-	// Barra: en flujo normal y con composición forzada (Android)
+	// Badge REGRESIÓN
+	regBadge: {
+		paddingHorizontal: 10,
+		paddingVertical: 4,
+		borderRadius: 999,
+		borderWidth: 1,
+		borderColor: "#7f1d1d",
+		backgroundColor: "rgba(239, 68, 68, 0.15)",
+	},
+	regBadgeText: {
+		color: "#fca5a5",
+		fontSize: 13,
+		fontWeight: "800",
+		letterSpacing: 1,
+	},
+
+	// Barra
 	progressBar: {
 		width: "90%",
 		height: BAR_H,
@@ -532,14 +676,36 @@ const styles = StyleSheet.create({
 		borderWidth: 1,
 		borderColor: "#374151",
 		overflow: "hidden",
-		opacity: 0.999, // fuerza composición en Android
+		opacity: 0.999,
 		alignSelf: "center",
+		shadowColor: "#000",
+		shadowOpacity: 0.15,
+		shadowRadius: 4,
+		shadowOffset: { width: 0, height: 1 },
 	},
 	progressFill: {
 		height: "100%",
 		backgroundColor: "#60a5fa",
 		borderTopRightRadius: BAR_R,
 		borderBottomRightRadius: BAR_R,
+	},
+
+	// Pulso rojo durante REGRESIÓN
+	progressBarRegA: {
+		borderColor: "#ef4444",
+		shadowColor: "#ef4444",
+		shadowOpacity: 0.55,
+		shadowRadius: 10,
+		shadowOffset: { width: 0, height: 0 },
+		elevation: 10,
+	},
+	progressBarRegB: {
+		borderColor: "#b91c1c",
+		shadowColor: "#b91c1c",
+		shadowOpacity: 0.35,
+		shadowRadius: 6,
+		shadowOffset: { width: 0, height: 0 },
+		elevation: 6,
 	},
 
 	percent: { color: "#e5e7eb", fontSize: 18, fontVariant: ["tabular-nums"], textAlign: "center" },
@@ -566,13 +732,38 @@ const styles = StyleSheet.create({
 		shadowOffset: { width: 0, height: 0 },
 	},
 
-	controls: { flexDirection: "row", gap: 12, justifyContent: "center", marginTop: 12 },
-	button: {
-		paddingHorizontal: 18,
-		paddingVertical: 12,
-		borderRadius: 999,
-		borderWidth: 1,
+	// ===== Patada (derecha 20%) =====
+	kickArea: {
+		width: "20%",
+		borderRadius: 20,
+		borderWidth: 2,
+		borderColor: "#7f1d1d",
+		backgroundColor: "#0b0b0c",
+		alignItems: "center",
+		justifyContent: "center",
+		padding: 12,
+		marginLeft: 10,
 	},
-	primary: { backgroundColor: "#1f2937", borderColor: "#374151" },
-	buttonText: { color: "#e5e7eb", fontSize: 16, fontWeight: "600" },
+	kickDisabled: {
+		opacity: 0.6,
+	},
+
+	kickTitle: { color: "#fecaca", fontSize: 20, fontWeight: "800", letterSpacing: 1, marginBottom: 6 },
+	kickHint: { color: "#fca5a5", fontSize: 14, marginBottom: 10 },
+
+	kickBar: {
+		width: "60%",
+		height: "60%",
+		borderRadius: 12,
+		borderWidth: 1.5,
+		borderColor: "#ef4444",
+		backgroundColor: "#1a0d0d",
+		overflow: "hidden",
+		alignItems: "stretch",
+		justifyContent: "flex-end",
+	},
+	kickFill: {
+		width: "100%",
+		backgroundColor: "#ef4444",
+	},
 });
