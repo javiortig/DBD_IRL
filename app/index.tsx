@@ -1,21 +1,25 @@
 // app/index.tsx
-// Audio por tramos + variantes Repairing (sin Gen_start).
-// - Histeresis "repairingSmooth" para ignorar taps rápidos.
-// - Retención mínima de pista para evitar cambios nerviosos.
-// - Al completar: loop de Generator_Completed + notificación one-shot.
-// - Reset: silencio total.
+// Multitouch fluido con hovers precisos (pageX/pageY).
+// Contenido en flujo normal (sin absolutos) -> sin solapes: Título, Jugadores, Barra, %, Hint/OK.
+// Barra visible en Android con composición forzada. Overlay de anillos (pointerEvents: none).
+// Histeresis repairing, retención de pista, audio por tramos, completado con loop + notif.
+// Orientación bloqueada a landscape.
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
 import { useKeepAwake } from "expo-keep-awake";
+import * as ScreenOrientation from "expo-screen-orientation";
 import React, { useEffect, useRef, useState } from "react";
 import {
+	AppState,
+	findNodeHandle,
 	GestureResponderEvent,
 	Pressable,
 	SafeAreaView,
 	StatusBar,
 	StyleSheet,
 	Text,
+	UIManager,
 	View,
 } from "react-native";
 
@@ -25,9 +29,13 @@ const SOLO_SECONDS = 80;
 const BOOST_PER_EXTRA = 1;
 const MAX_PLAYER_REPAIR_PENALTY = 0.7;
 
+// ==== Barra ====
+const BAR_H = 22;
+const BAR_R = 12;
+
 // ==== Audio ====
 const VOL = 0.7;
-const XFADE_MS = 160; // duración del crossfade
+const XFADE_MS = 160;
 
 const SFX = {
 	gen1: require("../assets/sfx/Gen1.wav"),
@@ -48,7 +56,6 @@ function getSpeedMultiplier(players: number) {
 	return Math.pow(players, MAX_PLAYER_REPAIR_PENALTY);
 }
 
-// Fade simple
 async function fadeVolume(sound: Audio.Sound, from: number, to: number, ms: number) {
 	const steps = 6;
 	const stepTime = Math.max(10, Math.round(ms / steps));
@@ -62,6 +69,11 @@ async function fadeVolume(sound: Audio.Sound, from: number, to: number, ms: numb
 export default function Engine() {
 	useKeepAwake();
 
+	// Bloqueo de orientación a horizontal
+	useEffect(() => {
+		ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE).catch(() => {});
+	}, []);
+
 	const [progress, setProgress] = useState(0); // 0..1
 	const [playersTouching, setPlayersTouching] = useState(0);
 	const [isComplete, setIsComplete] = useState(false);
@@ -71,22 +83,55 @@ export default function Engine() {
 	const lastTsRef = useRef<number | null>(null);
 	const basePerSecond = 1 / SOLO_SECONDS;
 
-	// AUDIO: precarga y estado
+	// Audio
 	const soundsRef = useRef<Partial<Record<TrackKey, Audio.Sound>>>({});
 	const currentKeyRef = useRef<TrackKey | null>(null);
 	const currentRef = useRef<Audio.Sound | null>(null);
 	const stoppingRef = useRef(false);
 
-	// ==== Histeresis para "repairing" ====
-	const REPAIRING_ON_DELAY_MS = 120;
-	const REPAIRING_OFF_DELAY_MS = 220;
+	// Histeresis repairing (suaviza flapping)
+	const REPAIRING_ON_DELAY_MS = 10;
+	const REPAIRING_OFF_DELAY_MS = 10;
 	const [repairingSmooth, setRepairingSmooth] = useState(false);
 	const onTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const offTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-	// Retención mínima de pista para evitar cambios muy seguidos
+	// Retención mínima de pista
 	const MIN_TRACK_HOLD_MS = 250;
 	const lastSwitchRef = useRef(0);
+
+	// Refs para chequeo post-frame
+	const lastNativeTouchesCountRef = useRef(0);
+	const playersTouchingRef = useRef(0);
+	useEffect(() => { playersTouchingRef.current = playersTouching; }, [playersTouching]);
+
+	// ======= Layout absoluto del área de motor (para convertir pageX/Y a coords locales) =======
+	const engineRef = useRef<View | null>(null);
+	const engineRectRef = useRef<{ x: number; y: number; w: number; h: number }>({ x: 0, y: 0, w: 1, h: 1 });
+
+	const measureEngineInWindow = () => {
+		const node = findNodeHandle(engineRef.current);
+		if (!node) return;
+		// @ts-ignore
+		UIManager.measureInWindow?.(node, (x: number, y: number, w: number, h: number) => {
+			engineRectRef.current = { x, y, w: Math.max(1, w), h: Math.max(1, h) };
+		});
+	};
+
+	useEffect(() => {
+		measureEngineInWindow();
+		const sub = AppState.addEventListener("change", (state) => {
+			if (state === "active") setTimeout(measureEngineInWindow, 0);
+		});
+		return () => sub.remove();
+	}, []);
+
+	useEffect(() => {
+		const t = setTimeout(measureEngineInWindow, 0);
+		return () => clearTimeout(t);
+	}, []);
+
+	const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
 
 	useEffect(() => {
 		Audio.setAudioModeAsync({
@@ -97,7 +142,7 @@ export default function Engine() {
 		}).catch(() => {});
 	}, []);
 
-	// Precarga
+	// Precarga sonidos
 	useEffect(() => {
 		let mounted = true;
 		(async () => {
@@ -114,7 +159,7 @@ export default function Engine() {
 		return () => { mounted = false; };
 	}, []);
 
-	// Bucle de progreso
+	// Progreso
 	useEffect(() => {
 		const loop = (ts: number) => {
 			if (!lastTsRef.current) lastTsRef.current = ts;
@@ -138,21 +183,25 @@ export default function Engine() {
 
 	const triggerComplete = async () => {
 		setIsComplete(true);
+		clearTouches();
+		clearRepairingTimers();
+		setRepairingSmooth(false);
+
 		try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
 		await crossfadeTo("completed");
 		await playCompletedNotificationOnce();
 	};
 
-	// Histeresis repairingSmooth (suaviza taps rápidos)
+	// Histeresis repairing
 	useEffect(() => {
+		if (isComplete) return;
+
 		const raw = playersTouching > 0;
 
-		// Limpiar timers previos
 		if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
 		if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
 
 		if (raw) {
-			// Entrar a repairing tras pequeña espera
 			if (!repairingSmooth) {
 				onTimerRef.current = setTimeout(() => {
 					setRepairingSmooth(true);
@@ -160,7 +209,6 @@ export default function Engine() {
 				}, REPAIRING_ON_DELAY_MS);
 			}
 		} else {
-			// Salir de repairing tras espera un poco mayor
 			if (repairingSmooth) {
 				offTimerRef.current = setTimeout(() => {
 					setRepairingSmooth(false);
@@ -173,9 +221,13 @@ export default function Engine() {
 			if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
 			if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
 		};
-	}, [playersTouching, repairingSmooth]);
+	}, [playersTouching, repairingSmooth, isComplete]);
 
-	// Notificación de completado una sola vez
+	const clearRepairingTimers = () => {
+		if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
+		if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
+	};
+
 	const playCompletedNotificationOnce = async () => {
 		const s = soundsRef.current.completedNotif;
 		if (!s) return;
@@ -187,9 +239,8 @@ export default function Engine() {
 		} catch {}
 	};
 
-	// Pista a sonar por rango (p=0 → null ⇒ silencio)
 	const chooseLoopTrack = (p: number, repairing: boolean): TrackKey | null => {
-		if (p <= 0) return null; // silencio a 0%
+		if (p <= 0) return null;
 		if (p > 0 && p <= 0.25) return repairing ? "gen1Repair" : "gen1";
 		if (p > 0.25 && p <= 0.5) return repairing ? "gen2Repair" : "gen2";
 		if (p > 0.5 && p <= 0.75) return repairing ? "gen3Repair" : "gen3";
@@ -197,36 +248,27 @@ export default function Engine() {
 		return null;
 	};
 
-	// Observa cambios que afecten a audio
 	useEffect(() => {
 		(async () => {
-			// Si está completo, asegúrate de estar en completed
 			if (isComplete) {
 				if (currentKeyRef.current !== "completed") {
 					await crossfadeTo("completed");
 				}
 				return;
 			}
-
 			const desired = chooseLoopTrack(progress, repairingSmooth);
-
-			// p=0 ⇒ silencio
 			if (!desired) {
 				if (currentRef.current) await crossfadeTo(null);
 				return;
 			}
-
 			if (desired !== currentKeyRef.current) {
 				await crossfadeTo(desired);
 			}
 		})().catch(() => {});
-		 
 	}, [progress, repairingSmooth, isComplete]);
 
-	// Crossfade a nueva pista (o a silencio si key=null) con retención mínima
 	const crossfadeTo = async (key: TrackKey | null) => {
 		try {
-			// Retén cambios demasiado seguidos (suaviza flapping)
 			const now = Date.now();
 			if (currentKeyRef.current !== key && now - lastSwitchRef.current < MIN_TRACK_HOLD_MS) {
 				return;
@@ -242,8 +284,7 @@ export default function Engine() {
 			if (key) {
 				next = soundsRef.current[key] ?? null;
 				if (next) {
-					const shouldLoop = key !== "completedNotif"; // notif nunca por aquí
-					await next.setIsLoopingAsync(shouldLoop);
+					await next.setIsLoopingAsync(key !== "completedNotif");
 					await next.setVolumeAsync(0);
 					await next.setPositionAsync(0);
 					await next.playAsync();
@@ -270,33 +311,25 @@ export default function Engine() {
 		}
 	};
 
-	// Reset: silencio total (y limpiar histeresis)
 	const reset = async () => {
 		setProgress(0);
 		setIsComplete(false);
 		setRepairingSmooth(false);
+		clearRepairingTimers();
+		clearTouches();
+
 		try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); } catch {}
-
-		// Cancela timers de histeresis
-		if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
-		if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
-
-		// Silencio total
 		if (currentRef.current) await crossfadeTo(null);
-
-		// Por si la notificación estuviera sonando (poco probable)
 		if (soundsRef.current.completedNotif) {
 			await soundsRef.current.completedNotif.stopAsync().catch(() => {});
 		}
 	};
 
-	// Limpieza total al desmontar
 	useEffect(() => {
 		return () => {
 			(async () => {
 				try {
-					if (onTimerRef.current) { clearTimeout(onTimerRef.current); }
-					if (offTimerRef.current) { clearTimeout(offTimerRef.current); }
+					clearRepairingTimers();
 					if (currentRef.current) {
 						await currentRef.current.stopAsync().catch(() => {});
 					}
@@ -308,23 +341,70 @@ export default function Engine() {
 		};
 	}, []);
 
-	// === Multitouch ===
-	const updateTouches = (evt: GestureResponderEvent) => {
+	// === Multitouch FLUIDO con pageX/pageY → coords locales del engine ===
+	const readAllTouches = (evt?: GestureResponderEvent) => {
 		const touches = (evt?.nativeEvent as any)?.touches ?? [];
+		const { x, y, w, h } = engineRectRef.current;
 		const sliced = touches.slice(0, MAX_PLAYERS);
-		const points = sliced.map((t: any, idx: number) => ({
-			id: t.identifier ?? idx,
-			x: t.locationX,
-			y: t.locationY,
-		}));
+		const points = sliced.map((t: any, idx: number) => {
+			const px = t.pageX ?? 0;
+			const py = t.pageY ?? 0;
+			const lx = Math.max(0, Math.min(px - x, w));
+			const ly = Math.max(0, Math.min(py - y, h));
+			return { id: t.identifier ?? idx, x: lx, y: ly };
+		});
+		lastNativeTouchesCountRef.current = sliced.length;
+		return points as { id: number; x: number; y: number }[];
+	};
+
+	const applyTouches = (points: { id: number; x: number; y: number }[]) => {
 		setTouchPoints(points);
 		setPlayersTouching(points.length);
 	};
 
+	const clearTouches = () => {
+		setTouchPoints([]);
+		setPlayersTouching(0);
+		lastNativeTouchesCountRef.current = 0;
+	};
+
+	// Chequeo post-frame anti-fantasma
+	const postReleaseDoubleCheck = () => {
+		setTimeout(() => {
+			if (isComplete) return;
+			if (lastNativeTouchesCountRef.current === 0 && playersTouchingRef.current > 0) {
+				clearTouches();
+			}
+		}, 20);
+		requestAnimationFrame(() => {
+			if (isComplete) return;
+			if (lastNativeTouchesCountRef.current === 0 && playersTouchingRef.current > 0) {
+				clearTouches();
+			}
+		});
+	};
+
+	const updateTouches = (evt: GestureResponderEvent) => {
+		if (isComplete) return;
+		applyTouches(readAllTouches(evt));
+	};
+
 	const handleGrant = (e: GestureResponderEvent) => updateTouches(e);
 	const handleMove = (e: GestureResponderEvent) => updateTouches(e);
-	const handleRelease = (e: GestureResponderEvent) => updateTouches(e);
-	const handleTerminate = (e: GestureResponderEvent) => updateTouches(e);
+	const handleRelease = (e: GestureResponderEvent) => { updateTouches(e); postReleaseDoubleCheck(); };
+	const handleTerminate = (_e: GestureResponderEvent) => { clearTouches(); };
+
+	// Limpia toques si la app se va a background/inactiva
+	useEffect(() => {
+		const sub = AppState.addEventListener("change", (state) => {
+			if (state !== "active") {
+				clearTouches();
+				setRepairingSmooth(false);
+				setTimeout(measureEngineInWindow, 0);
+			}
+		});
+		return () => sub.remove();
+	}, []);
 
 	const percent = Math.round(progress * 100);
 
@@ -333,29 +413,66 @@ export default function Engine() {
 			<StatusBar hidden />
 			<View style={styles.container}>
 				<View
+					ref={engineRef}
 					style={[styles.engineArea, isComplete && styles.engineComplete]}
-					onStartShouldSetResponder={() => true}
-					onMoveShouldSetResponder={() => true}
+					collapsable={false}
+					onLayout={measureEngineInWindow}
+					pointerEvents={isComplete ? "none" : "auto"}
+					onStartShouldSetResponder={() => !isComplete}
+					onMoveShouldSetResponder={() => !isComplete}
 					onResponderGrant={handleGrant}
 					onResponderMove={handleMove}
 					onResponderRelease={handleRelease}
 					onResponderTerminate={handleTerminate}
+					onTouchEndCapture={(e) => {
+						const pts = readAllTouches(e);
+						if (pts.length === 0) clearTouches();
+						postReleaseDoubleCheck();
+					}}
+					onTouchCancel={(e) => {
+						const pts = readAllTouches(e);
+						if (pts.length === 0) clearTouches();
+						postReleaseDoubleCheck();
+					}}
 					accessible
 					accessibilityLabel="Área del motor"
 				>
-					{touchPoints.map(p => (
-						<View key={p.id} pointerEvents="none" style={[styles.touchRing, { left: p.x - 40, top: p.y - 40 }]} />
-					))}
-					<Text style={styles.title}>MOTOR</Text>
-					<Text style={styles.players}>Jugadores reparando: {playersTouching} / {MAX_PLAYERS}</Text>
-					<View style={styles.progressBar}>
-						<View style={[styles.progressFill, { width: `${percent}%` }]} />
+					{/* --- CAPA 1: Contenido en flujo normal --- */}
+					<View style={styles.content} pointerEvents="box-none">
+						<Text style={styles.title}>MOTOR</Text>
+
+						{!isComplete && (
+							<Text style={styles.players}>
+								Jugadores reparando: {playersTouching} / {MAX_PLAYERS}
+							</Text>
+						)}
+
+						{/* Barra en flujo normal (sin absolutos) */}
+						<View
+							style={styles.progressBar}
+							renderToHardwareTextureAndroid
+							needsOffscreenAlphaCompositing
+						>
+							<View style={[styles.progressFill, { width: `${percent}%` }]} />
+						</View>
+
+						{/* % debajo de la barra */}
+						<Text style={styles.percent}>{percent}%</Text>
+
+						{isComplete ? (
+							<Text style={styles.completeLabel}>¡REPARADO!</Text>
+						) : (
+							<Text style={styles.hint}>Colocad hasta 4 dedos a la vez</Text>
+						)}
 					</View>
-					<Text style={styles.percent}>{percent}%</Text>
-					{isComplete ? (
-						<Text style={styles.completeLabel}>¡REPARADO!</Text>
-					) : (
-						<Text style={styles.hint}>Colocad hasta 4 dedos a la vez</Text>
+
+					{/* --- CAPA 2: Anillos (encima, sin capturar eventos) --- */}
+					{!isComplete && (
+						<View style={styles.ringsOverlay} pointerEvents="none">
+							{touchPoints.map(p => (
+								<View key={p.id} style={[styles.touchRing, { left: p.x - 40, top: p.y - 40 }]} />
+							))}
+						</View>
 					)}
 				</View>
 
@@ -374,9 +491,8 @@ const styles = StyleSheet.create({
 	safe: { flex: 1, backgroundColor: "#0b0e10" },
 	container: {
 		flex: 1,
-		paddingHorizontal: 16,
-		paddingTop: 8,
-		paddingBottom: 16,
+		paddingHorizontal: 20,
+		paddingVertical: 16,
 		backgroundColor: "#0b0e10",
 	},
 	engineArea: {
@@ -387,10 +503,55 @@ const styles = StyleSheet.create({
 		backgroundColor: "#12161a",
 		alignItems: "center",
 		justifyContent: "center",
-		overflow: "hidden",
 		position: "relative",
+		overflow: "hidden",
+		paddingHorizontal: 24, // holgura lateral para landscape
+		paddingVertical: 16,   // holgura vertical para que nada se pise
 	},
 	engineComplete: { borderColor: "#4ade80", backgroundColor: "#122417" },
+
+	// Contenido en flujo normal y con separación vertical consistente
+	content: {
+		alignItems: "center",
+		justifyContent: "center",
+		gap: 14,        // separación vertical uniforme entre elementos
+		position: "relative",
+		zIndex: 1,
+		width: "100%",
+	},
+
+	title: { color: "#e5e7eb", fontSize: 34, fontWeight: "800", letterSpacing: 2, textAlign: "center" },
+	players: { color: "#9ca3af", fontSize: 18, textAlign: "center" },
+
+	// Barra: en flujo normal y con composición forzada (Android)
+	progressBar: {
+		width: "90%",
+		height: BAR_H,
+		borderRadius: BAR_R,
+		backgroundColor: "#111827",
+		borderWidth: 1,
+		borderColor: "#374151",
+		overflow: "hidden",
+		opacity: 0.999, // fuerza composición en Android
+		alignSelf: "center",
+	},
+	progressFill: {
+		height: "100%",
+		backgroundColor: "#60a5fa",
+		borderTopRightRadius: BAR_R,
+		borderBottomRightRadius: BAR_R,
+	},
+
+	percent: { color: "#e5e7eb", fontSize: 18, fontVariant: ["tabular-nums"], textAlign: "center" },
+	completeLabel: { color: "#4ade80", fontSize: 22, fontWeight: "700", textAlign: "center" },
+	hint: { color: "#94a3b8", fontSize: 16, textAlign: "center" },
+
+	// Overlay de anillos
+	ringsOverlay: {
+		position: "absolute",
+		left: 0, top: 0, right: 0, bottom: 0,
+		zIndex: 2,
+	},
 	touchRing: {
 		position: "absolute",
 		width: 80,
@@ -403,25 +564,9 @@ const styles = StyleSheet.create({
 		shadowOpacity: 0.6,
 		shadowRadius: 10,
 		shadowOffset: { width: 0, height: 0 },
-		elevation: 6,
 	},
-	title: { color: "#e5e7eb", fontSize: 32, fontWeight: "800", letterSpacing: 2 },
-	players: { color: "#9ca3af", marginTop: 6, fontSize: 16 },
-	progressBar: {
-		width: "90%",
-		height: 22,
-		borderRadius: 12,
-		backgroundColor: "#1f2937",
-		marginTop: 20,
-		overflow: "hidden",
-		borderWidth: 1,
-		borderColor: "#374151",
-	},
-	progressFill: { height: "100%", backgroundColor: "#60a5fa" },
-	percent: { color: "#e5e7eb", marginTop: 8, fontSize: 18, fontVariant: ["tabular-nums"] },
-	completeLabel: { color: "#4ade80", marginTop: 10, fontSize: 22, fontWeight: "700" },
-	hint: { color: "#94a3b8", marginTop: 10, fontSize: 14 },
-	controls: { flexDirection: "row", gap: 12, justifyContent: "center", marginTop: 14 },
+
+	controls: { flexDirection: "row", gap: 12, justifyContent: "center", marginTop: 12 },
 	button: {
 		paddingHorizontal: 18,
 		paddingVertical: 12,
