@@ -2,6 +2,7 @@
 // Motor (80%) + Zona de Patada (20%).
 // Indicador visual de REGRESIÓN + chispazos aleatorios (Gen_Spark1..9) cada 5–7s mientras hay regresión y nadie repara.
 // Multitouch fluido, audio por tramos, completado con loop+notif, landscape.
+// Hover centrado y más grande. Usa pageX/pageY + measureInWindow (versión estable).
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
@@ -29,6 +30,10 @@ const MAX_PLAYER_REPAIR_PENALTY = 0.7;
 // ==== Barra ====
 const BAR_H = 22;
 const BAR_R = 12;
+
+// ==== Hover ====
+const RING_SIZE = 96;          // antes 80
+const RING_RADIUS = RING_SIZE / 2; // 48
 
 // ==== Audio ====
 const VOL = 0.7;
@@ -194,47 +199,46 @@ export default function Engine() {
 			const dt = Math.min(0.1, (ts - lastTsRef.current) / 1000);
 			lastTsRef.current = ts;
 
-		setProgress(prev => {
-			if (isComplete) return prev;
+			setProgress(prev => {
+				if (isComplete) return prev;
 
-			let next = prev;
+				let next = prev;
 
-			const mult = getSpeedMultiplier(playersTouching) * BOOST_PER_EXTRA;
-			const repairRate = basePerSecond * mult;
+				const mult = getSpeedMultiplier(playersTouching) * BOOST_PER_EXTRA;
+				const repairRate = basePerSecond * mult;
 
-			const shouldRegress = regressionActiveRef.current && playersTouching === 0;
-			const regressRate = basePerSecond * REGRESSION_SPEED_MULT;
+				const shouldRegress = regressionActiveRef.current && playersTouching === 0;
+				const regressRate = basePerSecond * REGRESSION_SPEED_MULT;
 
-			if (shouldRegress) {
-				next = Math.max(0, next - regressRate * dt);
-			} else {
-				next = Math.min(1, next + repairRate * dt);
-			}
+				if (shouldRegress) {
+					next = Math.max(0, next - regressRate * dt);
+				} else {
+					next = Math.min(1, next + repairRate * dt);
+				}
 
-			// ⬇️ NUEVO: si llega a 0%, apagar regresión
-			if (next <= 0) {
-				regressionActiveRef.current = false;
-				setRegressionActive(false);
-				regressionRecoverBaselineRef.current = null;
-			}
+				// Si llega a 0%, apagar regresión
+				if (next <= 0) {
+					regressionActiveRef.current = false;
+					setRegressionActive(false);
+					regressionRecoverBaselineRef.current = null;
+				}
 
-			// Cancelación de regresión cuando reparan +5%
-			if (regressionActiveRef.current) {
-				if (playersTouching > 0) {
-					if (regressionRecoverBaselineRef.current === null) {
-						regressionRecoverBaselineRef.current = next;
-					} else if (next >= regressionRecoverBaselineRef.current + regressionRecoverAmount) {
-						regressionActiveRef.current = false;
-						setRegressionActive(false);
-						regressionRecoverBaselineRef.current = null;
+				// Cancelación de regresión cuando reparan +5%
+				if (regressionActiveRef.current) {
+					if (playersTouching > 0) {
+						if (regressionRecoverBaselineRef.current === null) {
+							regressionRecoverBaselineRef.current = next;
+						} else if (next >= regressionRecoverBaselineRef.current + regressionRecoverAmount) {
+							regressionActiveRef.current = false;
+							setRegressionActive(false);
+							regressionRecoverBaselineRef.current = null;
+						}
 					}
 				}
-			}
 
-			if (next >= 1 && !isComplete) triggerComplete();
-			return next;
-		});
-
+				if (next >= 1 && !isComplete) triggerComplete();
+				return next;
+			});
 
 			rafRef.current = requestAnimationFrame(loop);
 		};
@@ -363,8 +367,6 @@ export default function Engine() {
 					fadeVolume(next, 0, VOL, XFADE_MS),
 					fadeVolume(current, VOL, 0, XFADE_MS),
 				]);
-			  
-
 				await current.stopAsync().catch(() => {});
 			} else if (!next && current) {
 				await fadeVolume(current, VOL, 0, XFADE_MS);
@@ -372,6 +374,8 @@ export default function Engine() {
 			} else if (next && !current) {
 				await fadeVolume(next, 0, VOL, XFADE_MS);
 			}
+
+		  
 
 			currentRef.current = key ? next : null;
 			currentKeyRef.current = key ?? null;
@@ -385,13 +389,16 @@ export default function Engine() {
 		const touches = (evt?.nativeEvent as any)?.touches ?? [];
 		const { x, y, w, h } = engineRectRef.current;
 		const sliced = touches.slice(0, MAX_PLAYERS);
+
 		const points = sliced.map((t: any, idx: number) => {
+			// Versión estable: pageX/pageY -> coords locales al engine
 			const px = t.pageX ?? 0;
 			const py = t.pageY ?? 0;
 			const lx = Math.max(0, Math.min(px - x, w));
 			const ly = Math.max(0, Math.min(py - y, h));
 			return { id: t.identifier ?? idx, x: lx, y: ly };
 		});
+
 		lastNativeTouchesCountRef.current = sliced.length;
 		return points as { id: number; x: number; y: number }[];
 	};
@@ -437,8 +444,6 @@ export default function Engine() {
 
 	const kickReset = () => {
 		kickAnimatingRef.current = false;
-	  
-
 		kickStartTsRef.current = null;
 		setKickHold(0);
 		if (kickRafRef.current) {
@@ -463,6 +468,8 @@ export default function Engine() {
 		if (kickAnimatingRef.current) return;
 		kickAnimatingRef.current = true;
 		kickStartTsRef.current = Date.now();
+
+	  
 
 		const step = () => {
 			if (!kickAnimatingRef.current) return;
@@ -511,8 +518,8 @@ export default function Engine() {
 
 	const scheduleNextSpark = () => {
 		clearSparkTimer();
-		// siguiente disparo entre 5s y 7s
-		const delay = 5000 + Math.random() * 2000;
+		// entre 3 y 6 segundos de sonidos de chispa
+		const delay = 3000 + Math.random() * 3000;
 		sparkTimeoutRef.current = setTimeout(async () => {
 			// sólo chispa si sigue habiendo regresión y nadie repara
 			if (!isComplete && regressionActiveRef.current && playersTouchingRef.current === 0) {
@@ -640,11 +647,17 @@ export default function Engine() {
 						)}
 					</View>
 
-					{/* Overlay de anillos */}
+					{/* Overlay de anillos: hover centrado con transform */}
 					{!isComplete && (
 						<View style={styles.ringsOverlay} pointerEvents="none">
 							{touchPoints.map(p => (
-								<View key={p.id} style={[styles.touchRing, { left: p.x - 40, top: p.y - 40 }]} />
+								<View
+									key={p.id}
+									style={[
+										styles.touchRing,
+										{ left: p.x, top: p.y },
+									]}
+								/>
 							))}
 						</View>
 					)}
@@ -774,7 +787,7 @@ const styles = StyleSheet.create({
 	completeLabel: { color: "#4ade80", fontSize: 22, fontWeight: "700", textAlign: "center" },
 	hint: { color: "#94a3b8", fontSize: 16, textAlign: "center" },
 
-	// Overlay de anillos
+	// Overlay de anillos (encima de todo, sin interceptar eventos)
 	ringsOverlay: {
 		position: "absolute",
 		left: 0, top: 0, right: 0, bottom: 0,
@@ -782,9 +795,9 @@ const styles = StyleSheet.create({
 	},
 	touchRing: {
 		position: "absolute",
-		width: 80,
-		height: 80,
-		borderRadius: 40,
+		width: RING_SIZE,
+		height: RING_SIZE,
+		borderRadius: RING_RADIUS,
 		borderWidth: 2,
 		borderColor: "#60a5fa",
 		backgroundColor: "rgba(96,165,250,0.15)",
@@ -792,6 +805,8 @@ const styles = StyleSheet.create({
 		shadowOpacity: 0.6,
 		shadowRadius: 10,
 		shadowOffset: { width: 0, height: 0 },
+		// Centrado exacto respecto a (x,y)
+		transform: [{ translateX: -RING_RADIUS }, { translateY: -RING_RADIUS * 1.5 }],
 	},
 
 	// ===== Patada (derecha 20%) =====
