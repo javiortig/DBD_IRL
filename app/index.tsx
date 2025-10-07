@@ -1,9 +1,8 @@
 // app/index.tsx
 // Motor (80%) + Zona de Patada (20%).
-// Indicador visual de REGRESIÓN + chispazos aleatorios (Gen_Spark1..9) cada 5–7s mientras hay regresión y nadie repara.
-// Multitouch fluido, audio por tramos, completado con loop+notif, landscape.
-// Hover centrado y más grande. Usa pageX/pageY + measureInWindow (versión estable).
-// Patada con COOLDOWN global y contador visible + "tick" Gen_Kick.wav cada segundo mientras se mantiene.
+// Regresión + chispazos aleatorios (Gen_Spark1..9) 5–7s sin reparar.
+// Multitouch fluido, audio por tramos, completed loop+notif, landscape.
+// Hover centrado, patada con cooldown y tick, Skill Checks estilo DBD.
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
@@ -36,6 +35,10 @@ const BAR_R = 12;
 const RING_SIZE = 96;
 const RING_RADIUS = RING_SIZE / 2;
 
+// ==== Skill Check (círculo objetivo) ====
+const SKILL_RING_SIZE = 96; // tamaño del círculo objetivo (puedes subirlo si lo quieres más grande)
+const SKILL_RING_RADIUS = SKILL_RING_SIZE / 2;
+
 // ==== Audio ====
 const VOL = 0.7;
 const XFADE_MS = 160;
@@ -59,7 +62,7 @@ const SFX = {
 	completedNotif: require("../assets/sfx/Generator_Completed_Notification.wav"),
 	// Patada
 	break: require("../assets/sfx/Generator_Break.wav"),
-	kickTick: require("../assets/sfx/Gen_Kick.wav"), // ⬅️ tick cada segundo mientras mantienes
+	kickTick: require("../assets/sfx/Gen_Kick.wav"),
 	// Chispazos (sparks) durante regresión
 	spark1: require("../assets/sfx/sparks/Gen_Spark1.wav"),
 	spark2: require("../assets/sfx/sparks/Gen_Spark2.wav"),
@@ -70,6 +73,10 @@ const SFX = {
 	spark7: require("../assets/sfx/sparks/Gen_Spark7.wav"),
 	spark8: require("../assets/sfx/sparks/Gen_Spark8.wav"),
 	spark9: require("../assets/sfx/sparks/Gen_Spark9.wav"),
+	// Skill checks
+	skillCheck: require("../assets/sfx/Skill_Check.wav"),
+	explode: require("../assets/sfx/Gen_Explode.wav"),
+	good: require("../assets/sfx/Good_Skill_Check.wav"),
 } as const;
 
 type TrackKey = keyof typeof SFX;
@@ -87,6 +94,9 @@ async function fadeVolume(sound: Audio.Sound, from: number, to: number, ms: numb
 		if (i < steps) await new Promise(r => setTimeout(r, stepTime));
 	}
 }
+
+// ===== Skill state machine =====
+type SkillState = "NONE" | "RELEASE" | "AIM_PENDING" | "AIM_ACTIVE";
 
 export default function Engine() {
 	useKeepAwake();
@@ -145,7 +155,7 @@ export default function Engine() {
 	const playersTouchingRef = useRef(0);
 	useEffect(() => { playersTouchingRef.current = playersTouching; }, [playersTouching]);
 
-	// ======= Layout absoluto del motor (para convertir pageX/Y a coords locales) =======
+	// ======= Layout absoluto del motor =======
 	const engineRef = useRef<View | null>(null);
 	const engineRectRef = useRef<{ x: number; y: number; w: number; h: number }>({ x: 0, y: 0, w: 1, h: 1 });
 
@@ -165,7 +175,6 @@ export default function Engine() {
 		});
 		return () => sub.remove();
 	}, []);
-
 	useEffect(() => {
 		const t = setTimeout(measureEngineInWindow, 0);
 		return () => clearTimeout(t);
@@ -180,7 +189,7 @@ export default function Engine() {
 		}).catch(() => {});
 	}, []);
 
-	// Precarga sonidos (incluye sparks y kickTick)
+	// Precarga sonidos (incluye sparks/kick/skills)
 	useEffect(() => {
 		let mounted = true;
 		(async () => {
@@ -197,7 +206,11 @@ export default function Engine() {
 		return () => { mounted = false; };
 	}, []);
 
-	// --- Progreso + Regresión ---
+	// --- Progreso + Regresión + FREEZE en Skill ---
+	const skillStateRef = useRef<SkillState>("NONE");
+	const [skillState, setSkillState] = useState<SkillState>("NONE");
+	useEffect(() => { skillStateRef.current = skillState; }, [skillState]);
+
 	useEffect(() => {
 		const basePerSecond = 1 / SOLO_SECONDS;
 		const loop = (ts: number) => {
@@ -207,9 +220,10 @@ export default function Engine() {
 
 			setProgress(prev => {
 				if (isComplete) return prev;
+				// Congela reparación/regresión durante cualquier fase de Skill
+				if (skillStateRef.current !== "NONE") return prev;
 
 				let next = prev;
-
 				const mult = getSpeedMultiplier(playersTouching) * BOOST_PER_EXTRA;
 				const repairRate = basePerSecond * mult;
 
@@ -264,6 +278,10 @@ export default function Engine() {
 		try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
 		await crossfadeTo("completed");
 		await playCompletedNotificationOnce();
+		// cancelar cualquier skill
+		cancelSkillTimers();
+		setSkillState("NONE");
+		setSkillTarget(null);
 	};
 
 	// Histeresis repairing
@@ -395,7 +413,7 @@ export default function Engine() {
 		const sliced = touches.slice(0, MAX_PLAYERS);
 
 		const points = sliced.map((t: any, idx: number) => {
-			// Versión estable: pageX/pageY -> coords locales al engine
+			// pageX/pageY -> coords locales al engine
 			const px = t.pageX ?? 0;
 			const py = t.pageY ?? 0;
 			const lx = Math.max(0, Math.min(px - x, w));
@@ -410,6 +428,30 @@ export default function Engine() {
 	const applyTouches = (points: { id: number; x: number; y: number }[]) => {
 		setTouchPoints(points);
 		setPlayersTouching(points.length);
+
+		// Si estamos en AIM_ACTIVE, el primer toque decide éxito/fracaso
+		if (skillStateRef.current === "AIM_ACTIVE" && !aimHandledRef.current) {
+			if (points.length > 0) {
+				let hit = false;
+				const tgt = skillTargetRef.current;
+				if (tgt) {
+					for (const p of points) {
+						const dx = p.x - tgt.x;
+						const dy = p.y - tgt.y;
+						if (dx * dx + dy * dy <= SKILL_RING_RADIUS * SKILL_RING_RADIUS) {
+							hit = true;
+							break;
+						}
+					}
+				}
+				aimHandledRef.current = true;
+				if (hit) {
+					handleSkillSuccess();
+				} else {
+					handleSkillFail();
+				}
+			}
+		}
 	};
 
 	const clearTouches = () => {
@@ -483,7 +525,6 @@ export default function Engine() {
 			await s.playAsync();
 		} catch {}
 	};
-
 	const kickPlayTick = async () => {
 		const s = soundsRef.current.kickTick;
 		if (!s) return;
@@ -495,34 +536,31 @@ export default function Engine() {
 		} catch {}
 	};
 
-	const isKickOnCooldown = () => {
-		return Date.now() < nextKickAtRef.current;
-	};
+	const isKickOnCooldown = () => Date.now() < nextKickAtRef.current;
 
 	const onKickStart = () => {
 		if (isComplete) return;
-		if (isKickOnCooldown()) return; // bloquea si hay cooldown
+		// Bloqueada si cooldown o si una Skill está activa
+		if (isKickOnCooldown() || skillStateRef.current !== "NONE") return;
 		if (kickAnimatingRef.current) return;
 
 		kickAnimatingRef.current = true;
 		kickStartTsRef.current = Date.now();
 
-		// inicia tick inmediato (segundo 0) y programa los siguientes por tiempo
-		nextKickTickAtRef.current = Date.now(); // disparo inmediato
+		// inicia tick inmediato (segundo 0)
+		nextKickTickAtRef.current = Date.now();
 
 		const step = () => {
 			if (!kickAnimatingRef.current) return;
-
-			// si entra cooldown en medio, aborta
-			if (isKickOnCooldown()) {
+			if (isKickOnCooldown() || skillStateRef.current !== "NONE") {
 				kickReset();
 				return;
 			}
 
-			// Reproducir tick si toca (cada 1000 ms)
+			// tick cada 1s
 			if (nextKickTickAtRef.current !== null && Date.now() >= nextKickTickAtRef.current) {
 				kickPlayTick().catch(() => {});
-				nextKickTickAtRef.current += 1000; // siguiente tick en +1s
+				nextKickTickAtRef.current += 1000;
 			}
 
 			const elapsed = Date.now() - (kickStartTsRef.current ?? Date.now());
@@ -559,11 +597,8 @@ export default function Engine() {
 	};
 
 	const onKickEnd = () => {
-		// si no completó, cancelar y vaciar la barra
 		if (kickAnimatingRef.current) {
 			kickReset();
-		} else {
-			// si completó, ya se vacía arriba
 		}
 	};
 
@@ -575,15 +610,12 @@ export default function Engine() {
 			sparkTimeoutRef.current = null;
 		}
 	};
-
 	const scheduleNextSpark = () => {
 		clearSparkTimer();
-		// siguiente disparo entre 5s y 7s
 		const delay = 5000 + Math.random() * 2000;
 		sparkTimeoutRef.current = setTimeout(async () => {
-			// sólo chispa si sigue habiendo regresión y nadie repara
 			if (!isComplete && regressionActiveRef.current && playersTouchingRef.current === 0) {
-				const idx = 1 + Math.floor(Math.random() * 9); // 1..9
+				const idx = 1 + Math.floor(Math.random() * 9);
 				const key = (`spark${idx}`) as TrackKey;
 				const s = soundsRef.current[key];
 				if (s) {
@@ -595,18 +627,11 @@ export default function Engine() {
 					} catch {}
 				}
 			}
-			// reprogramar siguiente
 			scheduleNextSpark();
 		}, delay);
 	};
-
-	// Arranca/para el planificador de chispazos al entrar/salir de regresión
 	useEffect(() => {
-		if (regressionActive) {
-			scheduleNextSpark();
-		} else {
-			clearSparkTimer();
-		}
+		if (regressionActive) scheduleNextSpark(); else clearSparkTimer();
 		return () => clearSparkTimer();
 	}, [regressionActive]);
 
@@ -616,10 +641,11 @@ export default function Engine() {
 			if (rafRef.current) cancelAnimationFrame(rafRef.current);
 			if (kickRafRef.current) cancelAnimationFrame(kickRafRef.current);
 			clearSparkTimer();
+			cancelSkillTimers();
 		};
 	}, []);
 
-	// Limpia toques si la app se va a background/inactiva
+	// Limpia toques al ir a background
 	useEffect(() => {
 		const sub = AppState.addEventListener("change", (state) => {
 			if (state !== "active") {
@@ -630,18 +656,169 @@ export default function Engine() {
 				setRegressionActive(false);
 				regressionRecoverBaselineRef.current = null;
 				clearSparkTimer();
+				cancelSkillTimers();
+				setSkillState("NONE");
+				setSkillTarget(null);
 				setTimeout(measureEngineInWindow, 0);
 			}
 		});
 		return () => sub.remove();
 	}, []);
 
+	// ====== SKILL CHECKS ======
+	const skillTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const clearSkillTimer = () => {
+		if (skillTimerRef.current) {
+			clearTimeout(skillTimerRef.current);
+			skillTimerRef.current = null;
+		}
+	};
+	const cancelSkillTimers = () => {
+		clearSkillTimer();
+		if (aimDeadlineRef.current) {
+			clearTimeout(aimDeadlineRef.current);
+			aimDeadlineRef.current = null;
+		}
+	};
+
+	// Objetivo de la skill (círculo)
+	const [skillTarget, setSkillTarget] = useState<{ x: number; y: number } | null>(null);
+	const skillTargetRef = useRef<{ x: number; y: number } | null>(null);
+	useEffect(() => { skillTargetRef.current = skillTarget; }, [skillTarget]);
+
+	// AIM deadline y flag de primer toque evaluado
+	const aimDeadlineRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const aimHandledRef = useRef(false);
+
+	// Programación automática de skills según condiciones
+	const scheduleSkillRandom = (minMs: number, maxMs: number) => {
+		clearSkillTimer();
+		const delay = Math.floor(minMs + Math.random() * (maxMs - minMs));
+		skillTimerRef.current = setTimeout(() => {
+			// Comprobar condiciones en el momento del disparo
+			if (
+				!isComplete &&
+				!regressionActiveRef.current &&
+				playersTouchingRef.current > 0 &&
+				skillStateRef.current === "NONE"
+			) {
+				startSkillReleasePhase().catch(() => {});
+			} else {
+				// Si no se puede, reintentar cuando vuelvan las condiciones
+				clearSkillTimer();
+			}
+		}, delay);
+	};
+
+	// Cuando cambian condiciones, arma/cancela
+	useEffect(() => {
+		if (isComplete || regressionActive || skillState !== "NONE") {
+			clearSkillTimer();
+			return;
+		}
+		if (playersTouching > 0) {
+			// Si no hay timer, es la primera desde que empezaron a reparar: 1..16s
+			if (!skillTimerRef.current) scheduleSkillRandom(1000, 16000);
+		} else {
+			clearSkillTimer();
+		}
+	}, [playersTouching, regressionActive, isComplete, skillState]);
+
+	// ----- FASE 1: RELEASE (1s para soltar) -----
+	const playOnce = async (key: TrackKey) => {
+		const s = soundsRef.current[key];
+		if (!s) return;
+		try {
+			await s.setIsLoopingAsync(false);
+			await s.setVolumeAsync(VOL);
+			await s.setPositionAsync(0);
+			await s.playAsync();
+		} catch {}
+	};
+
+	const startSkillReleasePhase = async () => {
+		setSkillState("RELEASE");
+		setSkillTarget(null);
+		aimHandledRef.current = false;
+
+		// Sonido de aviso
+		playOnce("skillCheck").catch(() => {});
+
+		// Tras 1s evaluamos si soltaron todos
+		clearSkillTimer();
+		skillTimerRef.current = setTimeout(() => {
+			if (playersTouchingRef.current === 0) {
+				// PASAN la primera parte → espera 1s y arma AIM en los siguientes 0..5s
+				setSkillState("AIM_PENDING");
+				clearSkillTimer();
+				skillTimerRef.current = setTimeout(() => {
+					// Aparece en algún momento de los próximos 0..5s
+					clearSkillTimer();
+					const delay = Math.floor(Math.random() * 5000);
+					skillTimerRef.current = setTimeout(() => {
+						startSkillAimActive();
+					}, delay);
+				}, 1000);
+			} else {
+				// FALLAN → explosión
+				handleSkillFail();
+			}
+		}, 1000);
+	};
+
+	// ----- FASE 2: AIM ACTIVE (círculo 1s para tocar dentro) -----
+	const startSkillAimActive = () => {
+		// Escoge posición aleatoria dentro del motor con margen para que entre el círculo
+		const { w, h } = engineRectRef.current;
+		const pad = SKILL_RING_RADIUS + 8;
+		const x = pad + Math.random() * Math.max(1, w - 2 * pad);
+		const y = pad + Math.random() * Math.max(1, h - 2 * pad);
+
+		setSkillTarget({ x, y });
+		aimHandledRef.current = false;
+		setSkillState("AIM_ACTIVE");
+
+		// Si no tocan en <1s → fallo
+		if (aimDeadlineRef.current) clearTimeout(aimDeadlineRef.current);
+		aimDeadlineRef.current = setTimeout(() => {
+			if (!aimHandledRef.current) {
+				handleSkillFail();
+			}
+		}, 1000);
+	};
+
+	// ÉXITO de skill (+5%) y reprogramar 15–25s
+	const handleSkillSuccess = () => {
+		if (aimDeadlineRef.current) { clearTimeout(aimDeadlineRef.current); aimDeadlineRef.current = null; }
+		setSkillState("NONE");
+		setSkillTarget(null);
+		playOnce("good").catch(() => {});
+		setProgress(prev => Math.min(1, prev + 0.05));
+		// Programar la siguiente si se mantienen las condiciones
+		if (!isComplete && !regressionActiveRef.current && playersTouchingRef.current > 0) {
+			scheduleSkillRandom(15000, 25000);
+		}
+	};
+
+	// FALLO de skill (explosión −10%, activa regresión)
+	const handleSkillFail = () => {
+		if (aimDeadlineRef.current) { clearTimeout(aimDeadlineRef.current); aimDeadlineRef.current = null; }
+		setSkillState("NONE");
+		setSkillTarget(null);
+		playOnce("explode").catch(() => {});
+		setProgress(prev => Math.max(0, prev - 0.10));
+		regressionActiveRef.current = true;
+		setRegressionActive(true);
+		regressionRecoverBaselineRef.current = null;
+		// No se programan skills hasta que cese la regresión (el efecto lo gestiona)
+	};
+
 	const percent = Math.round(progress * 100);
 
 	// Texto del cooldown
 	const cooldownSec = (kickCooldownLeftMs / 1000);
 	const cooldownLabel = cooldownSec > 0 ? `${cooldownSec.toFixed(1)}s` : "Listo";
-	const kickAreaDisabled = isComplete || cooldownSec > 0;
+	const kickAreaDisabled = isComplete || cooldownSec > 0 || skillState !== "NONE";
 
 	return (
 		<SafeAreaView style={styles.safe}>
@@ -651,7 +828,11 @@ export default function Engine() {
 				{/* ===== IZQUIERDA: MOTOR ===== */}
 				<View
 					ref={engineRef}
-					style={[styles.engineArea, isComplete && styles.engineComplete]}
+					style={[
+						styles.engineArea,
+						isComplete && styles.engineComplete,
+						skillState !== "NONE" && styles.engineSkill, // color especial en skill
+					]}
 					collapsable={false}
 					onLayout={measureEngineInWindow}
 					pointerEvents={isComplete ? "none" : "auto"}
@@ -677,6 +858,23 @@ export default function Engine() {
 					{/* Contenido en flujo */}
 					<View style={styles.engineContent} pointerEvents="box-none">
 						<Text style={styles.title}>MOTOR</Text>
+
+						{/* Aviso de Skill */}
+						{skillState === "RELEASE" && (
+							<View style={styles.skillBadge}>
+								<Text style={styles.skillBadgeText}>¡PRUEBA DE HABILIDAD! Soltad todos</Text>
+							</View>
+						)}
+						{skillState === "AIM_PENDING" && (
+							<View style={styles.skillBadgeDim}>
+								<Text style={styles.skillBadgeTextDim}>Preparados…</Text>
+							</View>
+						)}
+						{skillState === "AIM_ACTIVE" && (
+							<View style={styles.skillBadge}>
+								<Text style={styles.skillBadgeText}>¡TOCA EL CÍRCULO!</Text>
+							</View>
+						)}
 
 						{/* Badge de regresión */}
 						{regressionActive && (
@@ -708,11 +906,13 @@ export default function Engine() {
 						{isComplete ? (
 							<Text style={styles.completeLabel}>¡REPARADO!</Text>
 						) : (
-							<Text style={styles.hint}>Colocad hasta 4 dedos a la vez</Text>
+							<Text style={styles.hint}>
+								{skillState === "NONE" ? "Colocad hasta 4 dedos a la vez" : "Habilidad en curso…"}
+							</Text>
 						)}
 					</View>
 
-					{/* Overlay de anillos */}
+					{/* Overlay de anillos de dedos */}
 					{!isComplete && (
 						<View style={styles.ringsOverlay} pointerEvents="none">
 							{touchPoints.map(p => (
@@ -726,13 +926,25 @@ export default function Engine() {
 							))}
 						</View>
 					)}
+
+					{/* Overlay de CÍRCULO de skill (no intercepta eventos) */}
+					{skillState === "AIM_ACTIVE" && skillTarget && (
+						<View style={styles.skillOverlay} pointerEvents="none">
+							<View
+								style={[
+									styles.skillRing,
+									{ left: skillTarget.x, top: skillTarget.y },
+								]}
+							/>
+						</View>
+					)}
 				</View>
 
 				{/* ===== DERECHA: PATEAR (ASESINO) ===== */}
 				<View
 					style={[
-						styles.kickArea,
-						(isComplete || cooldownSec > 0) && styles.kickDisabled,
+					 styles.kickArea,
+					 (isComplete || cooldownSec > 0 || skillState !== "NONE") && styles.kickDisabled,
 					]}
 					onStartShouldSetResponder={() => !kickAreaDisabled}
 					onMoveShouldSetResponder={() => !kickAreaDisabled}
@@ -744,7 +956,7 @@ export default function Engine() {
 				>
 					<Text style={styles.kickTitle}>PATADA</Text>
 					<Text style={styles.kickHint}>
-						{cooldownSec > 0 ? `Espera ${cooldownLabel}` : "Mantén 3s"}
+						{cooldownSec > 0 ? `Espera ${cooldownLabel}` : (skillState !== "NONE" ? "Bloqueado" : "Mantén 3s")}
 					</Text>
 
 					{/* Barra vertical roja de carga */}
@@ -783,6 +995,7 @@ const styles = StyleSheet.create({
 		paddingVertical: 16,
 	},
 	engineComplete: { borderColor: "#4ade80", backgroundColor: "#122417" },
+	engineSkill: { borderColor: "#f59e0b", backgroundColor: "#1f1a0a" },
 
 	engineContent: {
 		alignItems: "center",
@@ -796,7 +1009,7 @@ const styles = StyleSheet.create({
 	title: { color: "#e5e7eb", fontSize: 34, fontWeight: "800", letterSpacing: 2, textAlign: "center" },
 	players: { color: "#9ca3af", fontSize: 18, textAlign: "center" },
 
-	// Badge REGRESIÓN
+	// Badges
 	regBadge: {
 		paddingHorizontal: 10,
 		paddingVertical: 4,
@@ -811,8 +1024,36 @@ const styles = StyleSheet.create({
 		fontWeight: "800",
 		letterSpacing: 1,
 	},
+	skillBadge: {
+		paddingHorizontal: 12,
+		paddingVertical: 6,
+		borderRadius: 999,
+		borderWidth: 1,
+		borderColor: "#b45309",
+		backgroundColor: "rgba(245, 158, 11, 0.18)",
+	},
+	skillBadgeText: {
+		color: "#fbbf24",
+		fontSize: 14,
+		fontWeight: "900",
+		letterSpacing: 1,
+	},
+	skillBadgeDim: {
+		paddingHorizontal: 10,
+		paddingVertical: 4,
+		borderRadius: 999,
+		borderWidth: 1,
+		borderColor: "#6b7280",
+		backgroundColor: "rgba(156, 163, 175, 0.15)",
+	},
+	skillBadgeTextDim: {
+		color: "#d1d5db",
+		fontSize: 13,
+		fontWeight: "800",
+		letterSpacing: 1,
+	},
 
-	// Barra
+	// Barra de progreso
 	progressBar: {
 		width: "90%",
 		height: BAR_H,
@@ -857,7 +1098,7 @@ const styles = StyleSheet.create({
 	completeLabel: { color: "#4ade80", fontSize: 22, fontWeight: "700", textAlign: "center" },
 	hint: { color: "#94a3b8", fontSize: 16, textAlign: "center" },
 
-	// Overlay de anillos (encima de todo, sin interceptar eventos)
+	// Overlay de anillos (dedos)
 	ringsOverlay: {
 		position: "absolute",
 		left: 0, top: 0, right: 0, bottom: 0,
@@ -876,6 +1117,27 @@ const styles = StyleSheet.create({
 		shadowRadius: 10,
 		shadowOffset: { width: 0, height: 0 },
 		transform: [{ translateX: -RING_RADIUS }, { translateY: -RING_RADIUS * 1.5 }],
+	},
+
+	// Overlay del círculo de Skill
+	skillOverlay: {
+		position: "absolute",
+		left: 0, top: 0, right: 0, bottom: 0,
+		zIndex: 3,
+	},
+	skillRing: {
+		position: "absolute",
+		width: SKILL_RING_SIZE,
+		height: SKILL_RING_SIZE,
+		borderRadius: SKILL_RING_RADIUS,
+		borderWidth: 3,
+		borderColor: "#fbbf24",
+		backgroundColor: "rgba(251,191,36,0.12)",
+		shadowColor: "#fbbf24",
+		shadowOpacity: 0.6,
+		shadowRadius: 12,
+		shadowOffset: { width: 0, height: 0 },
+		transform: [{ translateX: -SKILL_RING_RADIUS }, { translateY: -SKILL_RING_RADIUS }],
 	},
 
 	// ===== Patada (derecha 20%) =====
