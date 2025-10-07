@@ -3,6 +3,7 @@
 // Indicador visual de REGRESIÓN + chispazos aleatorios (Gen_Spark1..9) cada 5–7s mientras hay regresión y nadie repara.
 // Multitouch fluido, audio por tramos, completado con loop+notif, landscape.
 // Hover centrado y más grande. Usa pageX/pageY + measureInWindow (versión estable).
+// Patada con COOLDOWN global y contador visible + "tick" Gen_Kick.wav cada segundo mientras se mantiene.
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
@@ -32,12 +33,16 @@ const BAR_H = 22;
 const BAR_R = 12;
 
 // ==== Hover ====
-const RING_SIZE = 96;          // antes 80
-const RING_RADIUS = RING_SIZE / 2; // 48
+const RING_SIZE = 96;
+const RING_RADIUS = RING_SIZE / 2;
 
 // ==== Audio ====
 const VOL = 0.7;
 const XFADE_MS = 160;
+
+// ==== Patada ====
+const KICK_HOLD_MS = 3000;      // mantener 3s para patear
+const KICK_COOLDOWN_MS = 20000; // cooldown global 20s
 
 const SFX = {
 	// Loops de progreso
@@ -54,6 +59,7 @@ const SFX = {
 	completedNotif: require("../assets/sfx/Generator_Completed_Notification.wav"),
 	// Patada
 	break: require("../assets/sfx/Generator_Break.wav"),
+	kickTick: require("../assets/sfx/Gen_Kick.wav"), // ⬅️ tick cada segundo mientras mantienes
 	// Chispazos (sparks) durante regresión
 	spark1: require("../assets/sfx/sparks/Gen_Spark1.wav"),
 	spark2: require("../assets/sfx/sparks/Gen_Spark2.wav"),
@@ -98,7 +104,6 @@ export default function Engine() {
 
 	const rafRef = useRef<number | null>(null);
 	const lastTsRef = useRef<number | null>(null);
-	const basePerSecond = 1 / SOLO_SECONDS;
 
 	// === Regresión tras patada ===
 	const REGRESSION_SPEED_MULT = 0.5; // 50% de la velocidad base de 1 survivor
@@ -175,7 +180,7 @@ export default function Engine() {
 		}).catch(() => {});
 	}, []);
 
-	// Precarga sonidos (incluye sparks)
+	// Precarga sonidos (incluye sparks y kickTick)
 	useEffect(() => {
 		let mounted = true;
 		(async () => {
@@ -194,6 +199,7 @@ export default function Engine() {
 
 	// --- Progreso + Regresión ---
 	useEffect(() => {
+		const basePerSecond = 1 / SOLO_SECONDS;
 		const loop = (ts: number) => {
 			if (!lastTsRef.current) lastTsRef.current = ts;
 			const dt = Math.min(0.1, (ts - lastTsRef.current) / 1000);
@@ -375,8 +381,6 @@ export default function Engine() {
 				await fadeVolume(next, 0, VOL, XFADE_MS);
 			}
 
-		  
-
 			currentRef.current = key ? next : null;
 			currentKeyRef.current = key ?? null;
 		} finally {
@@ -436,15 +440,32 @@ export default function Engine() {
 	};
 
 	// ==== ZONA DE PATEAR (derecha 20%) ====
-	const KICK_HOLD_MS = 3000;
-	const [kickHold, setKickHold] = useState(0); // 0..1
+	const [kickHold, setKickHold] = useState(0); // 0..1 (barra de mantener)
 	const kickAnimatingRef = useRef(false);
 	const kickStartTsRef = useRef<number | null>(null);
 	const kickRafRef = useRef<number | null>(null);
 
+	// COOLDOWN
+	const nextKickAtRef = useRef<number>(0);              // timestamp ms cuando puede patear de nuevo
+	const [kickCooldownLeftMs, setKickCooldownLeftMs] = useState(0);
+
+	// "tick" de patada cada segundo mientras se mantiene
+	const nextKickTickAtRef = useRef<number | null>(null);
+
+	// ticker ligero para el contador de cooldown
+	useEffect(() => {
+		const id = setInterval(() => {
+			const now = Date.now();
+			const left = Math.max(0, nextKickAtRef.current - now);
+			setKickCooldownLeftMs(left);
+		}, 200);
+		return () => clearInterval(id);
+	}, []);
+
 	const kickReset = () => {
 		kickAnimatingRef.current = false;
 		kickStartTsRef.current = null;
+		nextKickTickAtRef.current = null;
 		setKickHold(0);
 		if (kickRafRef.current) {
 			cancelAnimationFrame(kickRafRef.current);
@@ -463,26 +484,58 @@ export default function Engine() {
 		} catch {}
 	};
 
+	const kickPlayTick = async () => {
+		const s = soundsRef.current.kickTick;
+		if (!s) return;
+		try {
+			await s.setIsLoopingAsync(false);
+			await s.setVolumeAsync(VOL);
+			await s.setPositionAsync(0);
+			await s.playAsync();
+		} catch {}
+	};
+
+	const isKickOnCooldown = () => {
+		return Date.now() < nextKickAtRef.current;
+	};
+
 	const onKickStart = () => {
 		if (isComplete) return;
+		if (isKickOnCooldown()) return; // bloquea si hay cooldown
 		if (kickAnimatingRef.current) return;
+
 		kickAnimatingRef.current = true;
 		kickStartTsRef.current = Date.now();
 
-	  
+		// inicia tick inmediato (segundo 0) y programa los siguientes por tiempo
+		nextKickTickAtRef.current = Date.now(); // disparo inmediato
 
 		const step = () => {
 			if (!kickAnimatingRef.current) return;
+
+			// si entra cooldown en medio, aborta
+			if (isKickOnCooldown()) {
+				kickReset();
+				return;
+			}
+
+			// Reproducir tick si toca (cada 1000 ms)
+			if (nextKickTickAtRef.current !== null && Date.now() >= nextKickTickAtRef.current) {
+				kickPlayTick().catch(() => {});
+				nextKickTickAtRef.current += 1000; // siguiente tick en +1s
+			}
+
 			const elapsed = Date.now() - (kickStartTsRef.current ?? Date.now());
 			const pct = Math.min(1, elapsed / KICK_HOLD_MS);
 			setKickHold(pct);
+
 			if (pct >= 1) {
 				// Acción de patada
 				kickAnimatingRef.current = false;
 				kickRafRef.current = null;
 				setKickHold(1);
 
-				// Reproducir sonido break
+				// Sonido de rotura
 				kickPlayBreak().catch(() => {});
 
 				// Aplicar -20% y activar regresión
@@ -490,6 +543,14 @@ export default function Engine() {
 				regressionActiveRef.current = true;
 				setRegressionActive(true);
 				regressionRecoverBaselineRef.current = null;
+
+				// COOLDOWN de 20s
+				nextKickAtRef.current = Date.now() + KICK_COOLDOWN_MS;
+				setKickCooldownLeftMs(KICK_COOLDOWN_MS);
+
+				// limpiar barra y resetear estado de tick
+				nextKickTickAtRef.current = null;
+				setTimeout(() => setKickHold(0), 120);
 				return;
 			}
 			kickRafRef.current = requestAnimationFrame(step);
@@ -502,8 +563,7 @@ export default function Engine() {
 		if (kickAnimatingRef.current) {
 			kickReset();
 		} else {
-			// si completó, limpia visual tras un instante
-			setTimeout(() => setKickHold(0), 120);
+			// si completó, ya se vacía arriba
 		}
 	};
 
@@ -518,8 +578,8 @@ export default function Engine() {
 
 	const scheduleNextSpark = () => {
 		clearSparkTimer();
-		// entre 3 y 6 segundos de sonidos de chispa
-		const delay = 3000 + Math.random() * 3000;
+		// siguiente disparo entre 5s y 7s
+		const delay = 5000 + Math.random() * 2000;
 		sparkTimeoutRef.current = setTimeout(async () => {
 			// sólo chispa si sigue habiendo regresión y nadie repara
 			if (!isComplete && regressionActiveRef.current && playersTouchingRef.current === 0) {
@@ -577,6 +637,11 @@ export default function Engine() {
 	}, []);
 
 	const percent = Math.round(progress * 100);
+
+	// Texto del cooldown
+	const cooldownSec = (kickCooldownLeftMs / 1000);
+	const cooldownLabel = cooldownSec > 0 ? `${cooldownSec.toFixed(1)}s` : "Listo";
+	const kickAreaDisabled = isComplete || cooldownSec > 0;
 
 	return (
 		<SafeAreaView style={styles.safe}>
@@ -647,7 +712,7 @@ export default function Engine() {
 						)}
 					</View>
 
-					{/* Overlay de anillos: hover centrado con transform */}
+					{/* Overlay de anillos */}
 					{!isComplete && (
 						<View style={styles.ringsOverlay} pointerEvents="none">
 							{touchPoints.map(p => (
@@ -665,17 +730,22 @@ export default function Engine() {
 
 				{/* ===== DERECHA: PATEAR (ASESINO) ===== */}
 				<View
-					style={[styles.kickArea, isComplete && styles.kickDisabled]}
-					onStartShouldSetResponder={() => !isComplete}
-					onMoveShouldSetResponder={() => !isComplete}
-					onResponderGrant={() => { if (!isComplete) onKickStart(); }}
+					style={[
+						styles.kickArea,
+						(isComplete || cooldownSec > 0) && styles.kickDisabled,
+					]}
+					onStartShouldSetResponder={() => !kickAreaDisabled}
+					onMoveShouldSetResponder={() => !kickAreaDisabled}
+					onResponderGrant={() => { if (!kickAreaDisabled) onKickStart(); }}
 					onResponderRelease={onKickEnd}
 					onResponderTerminate={onKickEnd}
 					accessible
 					accessibilityLabel="Zona de patada del asesino"
 				>
 					<Text style={styles.kickTitle}>PATADA</Text>
-					<Text style={styles.kickHint}>Mantén 3s</Text>
+					<Text style={styles.kickHint}>
+						{cooldownSec > 0 ? `Espera ${cooldownLabel}` : "Mantén 3s"}
+					</Text>
 
 					{/* Barra vertical roja de carga */}
 					<View style={styles.kickBar}>
@@ -805,8 +875,7 @@ const styles = StyleSheet.create({
 		shadowOpacity: 0.6,
 		shadowRadius: 10,
 		shadowOffset: { width: 0, height: 0 },
-		// Centrado exacto respecto a (x,y)
-		transform: [{ translateX: -RING_RADIUS }, { translateY: -RING_RADIUS * 1.5 }],
+		transform: [{ translateX: -RING_RADIUS }, { translateY: -RING_RADIUS }],
 	},
 
 	// ===== Patada (derecha 20%) =====
@@ -824,7 +893,6 @@ const styles = StyleSheet.create({
 	kickDisabled: {
 		opacity: 0.6,
 	},
-
 	kickTitle: { color: "#fecaca", fontSize: 20, fontWeight: "800", letterSpacing: 1, marginBottom: 6 },
 	kickHint: { color: "#fca5a5", fontSize: 14, marginBottom: 10 },
 
