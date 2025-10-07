@@ -875,7 +875,7 @@ const styles = StyleSheet.create({
 		shadowOpacity: 0.6,
 		shadowRadius: 10,
 		shadowOffset: { width: 0, height: 0 },
-		transform: [{ translateX: -RING_RADIUS }, { translateY: -RING_RADIUS }],
+		transform: [{ translateX: -RING_RADIUS }, { translateY: -RING_RADIUS * 1.5 }],
 	},
 
 	// ===== Patada (derecha 20%) =====
