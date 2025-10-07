@@ -1,6 +1,6 @@
 // app/index.tsx
 // Motor (80%) + Zona de Patada (20%).
-// Indicador visual de REGRESIÓN: badge rojo + barra que late en rojo mientras hay regresión.
+// Indicador visual de REGRESIÓN + chispazos aleatorios (Gen_Spark1..9) cada 5–7s mientras hay regresión y nadie repara.
 // Multitouch fluido, audio por tramos, completado con loop+notif, landscape.
 
 import { Audio } from "expo-av";
@@ -35,6 +35,7 @@ const VOL = 0.7;
 const XFADE_MS = 160;
 
 const SFX = {
+	// Loops de progreso
 	gen1: require("../assets/sfx/Gen1.wav"),
 	gen1Repair: require("../assets/sfx/Gen1_Repairing.wav"),
 	gen2: require("../assets/sfx/Gen2.wav"),
@@ -43,9 +44,21 @@ const SFX = {
 	gen3Repair: require("../assets/sfx/Gen3_Repairing.wav"),
 	gen4: require("../assets/sfx/Gen4.wav"),
 	gen4Repair: require("../assets/sfx/Gen4_Repairing.wav"),
+	// Completado
 	completed: require("../assets/sfx/Generator_Completed.wav"),
 	completedNotif: require("../assets/sfx/Generator_Completed_Notification.wav"),
+	// Patada
 	break: require("../assets/sfx/Generator_Break.wav"),
+	// Chispazos (sparks) durante regresión
+	spark1: require("../assets/sfx/sparks/Gen_Spark1.wav"),
+	spark2: require("../assets/sfx/sparks/Gen_Spark2.wav"),
+	spark3: require("../assets/sfx/sparks/Gen_Spark3.wav"),
+	spark4: require("../assets/sfx/sparks/Gen_Spark4.wav"),
+	spark5: require("../assets/sfx/sparks/Gen_Spark5.wav"),
+	spark6: require("../assets/sfx/sparks/Gen_Spark6.wav"),
+	spark7: require("../assets/sfx/sparks/Gen_Spark7.wav"),
+	spark8: require("../assets/sfx/sparks/Gen_Spark8.wav"),
+	spark9: require("../assets/sfx/sparks/Gen_Spark9.wav"),
 } as const;
 
 type TrackKey = keyof typeof SFX;
@@ -85,7 +98,7 @@ export default function Engine() {
 	// === Regresión tras patada ===
 	const REGRESSION_SPEED_MULT = 0.5; // 50% de la velocidad base de 1 survivor
 	const regressionActiveRef = useRef(false);
-	const [regressionActive, setRegressionActive] = useState(false); // para renderizar UI
+	const [regressionActive, setRegressionActive] = useState(false); // para UI
 	const regressionRecoverBaselineRef = useRef<number | null>(null);
 	const regressionRecoverAmount = 0.05; // +5%
 
@@ -131,8 +144,6 @@ export default function Engine() {
 		if (!node) return;
 		// @ts-ignore
 		UIManager.measureInWindow?.(node, (x: number, y: number, w: number, h: number) => {
-		  
-
 			engineRectRef.current = { x, y, w: Math.max(1, w), h: Math.max(1, h) };
 		});
 	};
@@ -159,7 +170,7 @@ export default function Engine() {
 		}).catch(() => {});
 	}, []);
 
-	// Precarga sonidos
+	// Precarga sonidos (incluye sparks)
 	useEffect(() => {
 		let mounted = true;
 		(async () => {
@@ -183,43 +194,47 @@ export default function Engine() {
 			const dt = Math.min(0.1, (ts - lastTsRef.current) / 1000);
 			lastTsRef.current = ts;
 
-			setProgress(prev => {
-				if (isComplete) return prev;
+		setProgress(prev => {
+			if (isComplete) return prev;
 
-				let next = prev;
+			let next = prev;
 
-				// Reparación
-				const mult = getSpeedMultiplier(playersTouching) * BOOST_PER_EXTRA;
-				const repairRate = basePerSecond * mult;
+			const mult = getSpeedMultiplier(playersTouching) * BOOST_PER_EXTRA;
+			const repairRate = basePerSecond * mult;
 
-				// Regresión (si está activa y no hay jugadores)
-				const shouldRegress = regressionActiveRef.current && playersTouching === 0;
-				const regressRate = basePerSecond * REGRESSION_SPEED_MULT;
+			const shouldRegress = regressionActiveRef.current && playersTouching === 0;
+			const regressRate = basePerSecond * REGRESSION_SPEED_MULT;
 
-				if (shouldRegress) {
-					next = Math.max(0, next - regressRate * dt);
-				} else {
-					next = Math.min(1, next + repairRate * dt);
-				}
+			if (shouldRegress) {
+				next = Math.max(0, next - regressRate * dt);
+			} else {
+				next = Math.min(1, next + repairRate * dt);
+			}
 
-				// Cancelación de regresión cuando reparan +5% desde que vuelven
-				if (regressionActiveRef.current) {
-					if (playersTouching > 0) {
-						if (regressionRecoverBaselineRef.current === null) {
-							regressionRecoverBaselineRef.current = next;
-						} else {
-							if (next >= regressionRecoverBaselineRef.current + regressionRecoverAmount) {
-								regressionActiveRef.current = false;
-								setRegressionActive(false);
-								regressionRecoverBaselineRef.current = null;
-							}
-						}
+			// ⬇️ NUEVO: si llega a 0%, apagar regresión
+			if (next <= 0) {
+				regressionActiveRef.current = false;
+				setRegressionActive(false);
+				regressionRecoverBaselineRef.current = null;
+			}
+
+			// Cancelación de regresión cuando reparan +5%
+			if (regressionActiveRef.current) {
+				if (playersTouching > 0) {
+					if (regressionRecoverBaselineRef.current === null) {
+						regressionRecoverBaselineRef.current = next;
+					} else if (next >= regressionRecoverBaselineRef.current + regressionRecoverAmount) {
+						regressionActiveRef.current = false;
+						setRegressionActive(false);
+						regressionRecoverBaselineRef.current = null;
 					}
 				}
+			}
 
-				if (next >= 1 && !isComplete) triggerComplete();
-				return next;
-			});
+			if (next >= 1 && !isComplete) triggerComplete();
+			return next;
+		});
+
 
 			rafRef.current = requestAnimationFrame(loop);
 		};
@@ -348,6 +363,8 @@ export default function Engine() {
 					fadeVolume(next, 0, VOL, XFADE_MS),
 					fadeVolume(current, VOL, 0, XFADE_MS),
 				]);
+			  
+
 				await current.stopAsync().catch(() => {});
 			} else if (!next && current) {
 				await fadeVolume(current, VOL, 0, XFADE_MS);
@@ -355,8 +372,6 @@ export default function Engine() {
 			} else if (next && !current) {
 				await fadeVolume(next, 0, VOL, XFADE_MS);
 			}
-
-		  
 
 			currentRef.current = key ? next : null;
 			currentKeyRef.current = key ?? null;
@@ -422,6 +437,8 @@ export default function Engine() {
 
 	const kickReset = () => {
 		kickAnimatingRef.current = false;
+	  
+
 		kickStartTsRef.current = null;
 		setKickHold(0);
 		if (kickRafRef.current) {
@@ -483,11 +500,55 @@ export default function Engine() {
 		}
 	};
 
-	// Limpieza
+	// ==== CHISPAZOS EN REGRESIÓN ====
+	const sparkTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const clearSparkTimer = () => {
+		if (sparkTimeoutRef.current) {
+			clearTimeout(sparkTimeoutRef.current);
+			sparkTimeoutRef.current = null;
+		}
+	};
+
+	const scheduleNextSpark = () => {
+		clearSparkTimer();
+		// siguiente disparo entre 5s y 7s
+		const delay = 5000 + Math.random() * 2000;
+		sparkTimeoutRef.current = setTimeout(async () => {
+			// sólo chispa si sigue habiendo regresión y nadie repara
+			if (!isComplete && regressionActiveRef.current && playersTouchingRef.current === 0) {
+				const idx = 1 + Math.floor(Math.random() * 9); // 1..9
+				const key = (`spark${idx}`) as TrackKey;
+				const s = soundsRef.current[key];
+				if (s) {
+					try {
+						await s.setIsLoopingAsync(false);
+						await s.setVolumeAsync(VOL);
+						await s.setPositionAsync(0);
+						await s.playAsync();
+					} catch {}
+				}
+			}
+			// reprogramar siguiente
+			scheduleNextSpark();
+		}, delay);
+	};
+
+	// Arranca/para el planificador de chispazos al entrar/salir de regresión
+	useEffect(() => {
+		if (regressionActive) {
+			scheduleNextSpark();
+		} else {
+			clearSparkTimer();
+		}
+		return () => clearSparkTimer();
+	}, [regressionActive]);
+
+	// Limpiezas
 	useEffect(() => {
 		return () => {
 			if (rafRef.current) cancelAnimationFrame(rafRef.current);
 			if (kickRafRef.current) cancelAnimationFrame(kickRafRef.current);
+			clearSparkTimer();
 		};
 	}, []);
 
@@ -501,6 +562,7 @@ export default function Engine() {
 				regressionActiveRef.current = false;
 				setRegressionActive(false);
 				regressionRecoverBaselineRef.current = null;
+				clearSparkTimer();
 				setTimeout(measureEngineInWindow, 0);
 			}
 		});
@@ -514,7 +576,7 @@ export default function Engine() {
 			<StatusBar hidden />
 			{/* Layout en fila: motor (80%) + patada (20%) */}
 			<View style={styles.row}>
-                {/* ===== IZQUIERDA: MOTOR ===== */}
+				{/* ===== IZQUIERDA: MOTOR ===== */}
 				<View
 					ref={engineRef}
 					style={[styles.engineArea, isComplete && styles.engineComplete]}
