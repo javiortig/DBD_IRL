@@ -1,8 +1,6 @@
 // app/index.tsx
-// Motor (80%) + Zona de Patada (20%).
-// Regresión + chispazos (Gen_Spark1..9) 5–7s sin reparar.
-// Multitouch fluido, audio por tramos, completed loop+notif, landscape.
-// Hover centrado, patada con cooldown y tick, Skill Checks estilo DBD (timers separados).
+// Motor + Patada + Regresión + Chispazos + Audio por tramos + Skillchecks DBD.
+// Bloqueos: Explosión(5s), Patada(15s), Abandono(5s). Nunca bloquear si ya está completado.
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
@@ -47,6 +45,11 @@ const XFADE_MS = 160;
 const KICK_HOLD_MS = 3000;
 const KICK_COOLDOWN_MS = 20000;
 
+// ==== Bloqueos ====
+const BLOCK_AFTER_EXPLOSION_MS = 5000;
+const BLOCK_AFTER_KICK_MS = 15000;
+const BLOCK_AFTER_ABANDON_MS = 5000;
+
 const SFX = {
   // Loops de progreso
   gen1: require("../assets/sfx/Gen1.wav"),
@@ -84,7 +87,6 @@ const SFX = {
 } as const;
 
 type TrackKey = keyof typeof SFX;
-
 type SkillState = "NONE" | "RELEASE" | "AIM_PENDING" | "AIM_ACTIVE";
 
 function getSpeedMultiplier(players: number) {
@@ -113,6 +115,9 @@ export default function Engine() {
   const [progress, setProgress] = useState(0);
   const [playersTouching, setPlayersTouching] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
+  const isCompleteRef = useRef(false);
+  useEffect(() => { isCompleteRef.current = isComplete; }, [isComplete]);
+
   const [touchPoints, setTouchPoints] = useState<{ id: number; x: number; y: number }[]>([]);
 
   const rafRef = useRef<number | null>(null);
@@ -135,6 +140,29 @@ export default function Engine() {
       setRegPulse(false);
     }
   }, [regressionActive]);
+
+  // ==== BLOQUEOS (con temporizador de UI) ====
+  const blockUntilRef = useRef<number>(0);
+  const [blockLeftMs, setBlockLeftMs] = useState(0);
+  const isBlocked = () => Date.now() < blockUntilRef.current;
+  const clearTouchesRef = useRef<null | (() => void)>(null);
+
+  const blockFor = (ms: number) => {
+    if (isCompleteRef.current) return; // ⬅️ no bloquear si ya está completo
+    blockUntilRef.current = Date.now() + ms;
+    setBlockLeftMs(ms);
+    clearTouchesRef.current?.(); // corta inputs/hover/cuenta
+  };
+
+  // ticker para UI de bloqueo
+  useEffect(() => {
+    const id = setInterval(() => {
+      const left = Math.max(0, blockUntilRef.current - Date.now());
+      setBlockLeftMs(left);
+    }, 100);
+    return () => clearInterval(id);
+  }, []);
+  const blockLabel = (blockLeftMs / 1000).toFixed(1) + "s";
 
   // Audio
   const soundsRef = useRef<Partial<Record<TrackKey, Audio.Sound>>>({});
@@ -213,7 +241,7 @@ export default function Engine() {
   useEffect(() => { skillStateRef.current = skillState; }, [skillState]);
 
   // Timers SEPARADOS
-  const skillScheduleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // próxima skill (1–16s ó 15–25s)
+  const skillScheduleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // próxima skill (10–15s tras empezar)
   const releaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);       // 1s para soltar
   const aimArmDelayRef = useRef<ReturnType<typeof setTimeout> | null>(null);        // 1s de espera
   const aimAppearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);     // 0–5s para mostrar círculo
@@ -239,15 +267,10 @@ export default function Engine() {
   useEffect(() => { skillTargetRef.current = skillTarget; }, [skillTarget]);
   const aimHandledRef = useRef(false);
 
-  // Programación de skill: primera (1–16s) o regular (15–25s)
-  const scheduleFirstSkill = () => {
+  // PROGRAMACIÓN de skill: 10–15s desde que empiezan a reparar, se resetea si paran
+  const scheduleSkillFromStart = () => {
     clearSkillScheduler();
-    const delay = 1000 + Math.floor(Math.random() * 15000); // [1s, 16s)
-    skillScheduleTimerRef.current = setTimeout(tryStartSkill, delay);
-  };
-  const scheduleRegularSkill = () => {
-    clearSkillScheduler();
-    const delay = 15000 + Math.floor(Math.random() * 10000); // [15s, 25s)
+    const delay = 10000 + Math.floor(Math.random() * 5000); // [10s, 15s)
     skillScheduleTimerRef.current = setTimeout(tryStartSkill, delay);
   };
 
@@ -257,47 +280,38 @@ export default function Engine() {
     if (
       !isComplete &&
       !regressionActiveRef.current &&
+      !isBlocked() &&
       playersTouchingRef.current > 0 &&
       skillStateRef.current === "NONE"
     ) {
       startSkillReleasePhase().catch(() => {});
-    } else {
-      // Si no se puede (p.ej. soltaron o hay regresión), no reprogramamos aquí;
-      // el efecto de abajo armará cuando vuelvan las condiciones.
     }
+    // Si no se puede, no reprogramamos aquí: el flanco de "empezar a reparar" lo hará.
   };
 
-  // Armar/cancelar scheduler según condiciones globales
+  // Arranque/reset de scheduling según empezar/dejar de reparar y estado
   const prevRepairingRef = useRef(false);
   useEffect(() => {
-    const repairingNow = playersTouching > 0;
+    const repairingNow = playersTouching > 0 && !isBlocked() && !regressionActive && !isComplete && skillState === "NONE";
     const repairingPrev = prevRepairingRef.current;
     prevRepairingRef.current = repairingNow;
 
-    if (isComplete || skillState !== "NONE" || regressionActive) {
-      // No programar mientras haya skill, regresión o esté completado
+    if (isComplete || regressionActive || isBlocked() || skillState !== "NONE") {
       clearSkillScheduler();
       return;
     }
 
-    // Si empezaron a reparar (flanco 0->>0), programar PRIMERA 1–16s
+    // Flanco 0->>reparando: programa 10–15s
     if (!repairingPrev && repairingNow) {
-      if (!skillScheduleTimerRef.current) scheduleFirstSkill();
+      scheduleSkillFromStart();
       return;
     }
 
-    // Si siguen reparando (estable) y no hay scheduler (p.ej. venimos de fin de regresión)
-    if (repairingNow && !skillScheduleTimerRef.current) {
-      // si venimos de una regresión que acaba de terminar, considera "primera" de nuevo
-      scheduleFirstSkill();
-      return;
-    }
-
-    // Si dejaron de reparar, cancela scheduler
-    if (!repairingNow) {
+    // Si dejan de reparar: cancelar temporizador
+    if (repairingPrev && !repairingNow) {
       clearSkillScheduler();
     }
-  }, [playersTouching, regressionActive, isComplete, skillState]);
+  }, [playersTouching, regressionActive, isComplete, skillState, blockLeftMs]);
 
   // --- Progreso + Regresión + FREEZE en Skill ---
   useEffect(() => {
@@ -310,6 +324,7 @@ export default function Engine() {
       setProgress(prev => {
         if (isComplete) return prev;
         if (skillStateRef.current !== "NONE") return prev; // FREEZE durante skill
+        if (isBlocked()) return prev; // FREEZE durante bloqueos
 
         let next = prev;
         const mult = getSpeedMultiplier(playersTouching) * BOOST_PER_EXTRA;
@@ -351,6 +366,17 @@ export default function Engine() {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [playersTouching, isComplete]);
 
+  const playOnce = async (key: TrackKey) => {
+    const s = soundsRef.current[key];
+    if (!s) return;
+    try {
+      await s.setIsLoopingAsync(false);
+      await s.setVolumeAsync(VOL);
+      await s.setPositionAsync(0);
+      await s.playAsync();
+    } catch {}
+  };
+
   const triggerComplete = async () => {
     setIsComplete(true);
     clearTouches();
@@ -360,9 +386,17 @@ export default function Engine() {
     setRegressionActive(false);
     regressionRecoverBaselineRef.current = null;
 
+    // limpia bloqueo al completar
+    blockUntilRef.current = 0;
+    setBlockLeftMs(0);
+
     try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
     await crossfadeTo("completed");
-    await playCompletedNotificationOnce();
+    // notif
+    const s = soundsRef.current.completedNotif;
+    if (s) {
+      try { await s.setIsLoopingAsync(false); await s.setVolumeAsync(VOL); await s.setPositionAsync(0); await s.playAsync(); } catch {}
+    }
 
     // cancelar skills
     cancelAllSkillTimers();
@@ -374,7 +408,7 @@ export default function Engine() {
   useEffect(() => {
     if (isComplete) return;
 
-    const raw = playersTouching > 0;
+    const raw = playersTouching > 0 && !isBlocked();
 
     if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
     if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
@@ -399,22 +433,11 @@ export default function Engine() {
       if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
       if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
     };
-  }, [playersTouching, repairingSmooth, isComplete]);
+  }, [playersTouching, repairingSmooth, isComplete, blockLeftMs]);
 
   const clearRepairingTimers = () => {
     if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
     if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
-  };
-
-  const playCompletedNotificationOnce = async () => {
-    const s = soundsRef.current.completedNotif;
-    if (!s) return;
-    try {
-      await s.setIsLoopingAsync(false);
-      await s.setVolumeAsync(VOL);
-      await s.setPositionAsync(0);
-      await s.playAsync();
-    } catch {}
   };
 
   // Elección de pista por tramo
@@ -436,6 +459,9 @@ export default function Engine() {
         }
         return;
       }
+      // Durante bloqueos o skills: mantener pista actual (o silencio)
+      if (isBlocked() || skillState !== "NONE") return;
+
       const desired = chooseLoopTrack(progress, repairingSmooth);
       if (!desired) {
         if (currentRef.current) await crossfadeTo(null);
@@ -445,7 +471,7 @@ export default function Engine() {
         await crossfadeTo(desired);
       }
     })().catch(() => {});
-  }, [progress, repairingSmooth, isComplete]);
+  }, [progress, repairingSmooth, isComplete, blockLeftMs, skillState]);
 
   // Crossfade genérico
   const crossfadeTo = async (key: TrackKey | null) => {
@@ -509,36 +535,55 @@ export default function Engine() {
   };
 
   const applyTouches = (points: { id: number; x: number; y: number }[]) => {
-    setTouchPoints(points);
-    setPlayersTouching(points.length);
+  // 1) Reglas de SKILL primero (antes de cualquier early-return que estreche a "NONE")
 
-    // Intento durante AIM_ACTIVE
-    if (skillStateRef.current === "AIM_ACTIVE" && !aimHandledRef.current) {
-      if (points.length > 0) {
-        let hit = false;
-        const tgt = skillTargetRef.current;
-        if (tgt) {
-          for (const p of points) {
-            const dx = p.x - tgt.x;
-            const dy = p.y - tgt.y;
-            if (dx * dx + dy * dy <= SKILL_RING_RADIUS * SKILL_RING_RADIUS) {
-              hit = true;
-              break;
-            }
+  // Intento prohibido durante AIM_PENDING: tocar antes de que salga el círculo => explota
+  if (skillStateRef.current === "AIM_PENDING" && points.length > 0) {
+    handleSkillFail();
+  }
+
+  // Intento durante AIM_ACTIVE (una sola vez)
+  if (skillStateRef.current === "AIM_ACTIVE" && !aimHandledRef.current) {
+    if (points.length > 0) {
+      let hit = false;
+      const tgt = skillTargetRef.current;
+      if (tgt) {
+        for (const p of points) {
+          const dx = p.x - tgt.x;
+          const dy = p.y - tgt.y;
+          if (dx * dx + dy * dy <= SKILL_RING_RADIUS * SKILL_RING_RADIUS) {
+            hit = true;
+            break;
           }
         }
-        aimHandledRef.current = true;
-        if (hit) handleSkillSuccess();
-        else handleSkillFail();
       }
+      aimHandledRef.current = true;
+      if (hit) handleSkillSuccess();
+      else handleSkillFail();
     }
-  };
+  }
+
+  // 2) Ahora sí: si está completo, bloqueado o en alguna fase de skill,
+  //    no hagas tracking “normal” de reparaciones / hovers
+  if (isComplete || isBlocked() || skillStateRef.current !== "NONE") {
+    setTouchPoints([]);
+    setPlayersTouching(0);
+    lastNativeTouchesCountRef.current = 0;
+    return;
+  }
+
+  // 3) Tracking normal (sin skills ni bloqueos)
+  setTouchPoints(points);
+  setPlayersTouching(points.length);
+};
+
 
   const clearTouches = () => {
     setTouchPoints([]);
     setPlayersTouching(0);
     lastNativeTouchesCountRef.current = 0;
   };
+  clearTouchesRef.current = clearTouches;
 
   const postReleaseDoubleCheck = () => {
     setTimeout(() => {
@@ -556,9 +601,48 @@ export default function Engine() {
   };
 
   const updateTouches = (evt: GestureResponderEvent) => {
-    if (isComplete) return;
+    if (isComplete || isBlocked()) return;
     applyTouches(readAllTouches(evt));
   };
+
+  // ==== BLOQUEO por ABANDONO (5s) ====
+  const suppressAbandonUntilRef = useRef(0);
+  const appActiveRef = useRef(true);
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state) => {
+      appActiveRef.current = (state === "active");
+      if (state !== "active") {
+        clearTouches();
+        setRepairingSmooth(false);
+        kickReset();
+        regressionActiveRef.current = false;
+        setRegressionActive(false);
+        regressionRecoverBaselineRef.current = null;
+        clearSparkTimer();
+        cancelAllSkillTimers();
+        setSkillState("NONE");
+        setSkillTarget(null);
+        setTimeout(measureEngineInWindow, 0);
+      }
+    });
+    return () => sub.remove();
+  }, []);
+
+  const prevTouchingRef = useRef(0);
+  useEffect(() => {
+    const prev = prevTouchingRef.current;
+    prevTouchingRef.current = playersTouching;
+
+    // flanco: de >0 a 0 -> posible bloqueo por abandono
+    if (prev > 0 && playersTouching === 0) {
+      if (skillStateRef.current !== "NONE") return;                // durante skill no
+      if (isBlocked()) return;
+      if (!appActiveRef.current) return;
+      if (Date.now() < suppressAbandonUntilRef.current) return;
+      if (isCompleteRef.current) return;                            // ⬅️ no bloquear si ya está completo
+      blockFor(BLOCK_AFTER_ABANDON_MS);
+    }
+  }, [playersTouching]);
 
   // ==== KICK (derecha) ====
   const [kickHold, setKickHold] = useState(0);
@@ -590,17 +674,6 @@ export default function Engine() {
     }
   };
 
-  const playOnce = async (key: TrackKey) => {
-    const s = soundsRef.current[key];
-    if (!s) return;
-    try {
-      await s.setIsLoopingAsync(false);
-      await s.setVolumeAsync(VOL);
-      await s.setPositionAsync(0);
-      await s.playAsync();
-    } catch {}
-  };
-
   const kickPlayBreak = () => playOnce("break");
   const kickPlayTick = () => playOnce("kickTick");
 
@@ -608,7 +681,7 @@ export default function Engine() {
 
   const onKickStart = () => {
     if (isComplete) return;
-    if (isKickOnCooldown() || skillStateRef.current !== "NONE") return;
+    if (isKickOnCooldown() || skillStateRef.current !== "NONE" || isBlocked()) return;
     if (kickAnimatingRef.current) return;
 
     kickAnimatingRef.current = true;
@@ -617,7 +690,7 @@ export default function Engine() {
 
     const step = () => {
       if (!kickAnimatingRef.current) return;
-      if (isKickOnCooldown() || skillStateRef.current !== "NONE") {
+      if (isKickOnCooldown() || skillStateRef.current !== "NONE" || isBlocked()) {
         kickReset();
         return;
       }
@@ -642,6 +715,8 @@ export default function Engine() {
         setRegressionActive(true);
         regressionRecoverBaselineRef.current = null;
 
+        // BLOQUEO 15s + cooldown 20s
+        blockFor(BLOCK_AFTER_KICK_MS);
         nextKickAtRef.current = Date.now() + KICK_COOLDOWN_MS;
         setKickCooldownLeftMs(KICK_COOLDOWN_MS);
 
@@ -683,39 +758,9 @@ export default function Engine() {
     return () => clearSparkTimer();
   }, [regressionActive]);
 
-  // Limpiezas
-  useEffect(() => {
-    return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      if (kickRafRef.current) cancelAnimationFrame(kickRafRef.current);
-      clearSparkTimer();
-      cancelAllSkillTimers();
-    };
-  }, []);
-
-  // Limpia al ir a background
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (state) => {
-      if (state !== "active") {
-        clearTouches();
-        setRepairingSmooth(false);
-        kickReset();
-        regressionActiveRef.current = false;
-        setRegressionActive(false);
-        regressionRecoverBaselineRef.current = null;
-        clearSparkTimer();
-        cancelAllSkillTimers();
-        setSkillState("NONE");
-        setSkillTarget(null);
-        setTimeout(measureEngineInWindow, 0);
-      }
-    });
-    return () => sub.remove();
-  }, []);
-
   // ===== Fases de SKILL =====
   const startSkillReleasePhase = async () => {
-    // Bloquear cualquier programador de próximas skills mientras dura esta
+    // Bloquear scheduling mientras dura esta skill
     clearSkillScheduler();
     setSkillState("RELEASE");
     setSkillTarget(null);
@@ -769,10 +814,11 @@ export default function Engine() {
     playOnce("good").catch(() => {});
     setProgress(prev => Math.min(1, prev + 0.05));
 
-    // Programar la siguiente en 15–25s si siguen reparando sin regresión
-    if (!isComplete && !regressionActiveRef.current && playersTouchingRef.current > 0) {
-      scheduleRegularSkill();
-    }
+    // Evitar bloqueo por "abandono" justo después de la skill
+    suppressAbandonUntilRef.current = Date.now() + 1500;
+
+    // Después de éxito, no programamos aquí: los supers dejan de reparar y al volver a poner dedos
+    // se programa de nuevo (10–15s) por el flanco de "empezar a reparar".
   };
 
   const handleSkillFail = () => {
@@ -784,8 +830,11 @@ export default function Engine() {
     regressionActiveRef.current = true;
     setRegressionActive(true);
     regressionRecoverBaselineRef.current = null;
-    // No programamos próxima hasta que vuelva a haber reparación sin regresión;
-    // el efecto de scheduling se encargará cuando toque.
+
+    // BLOQUEO por explosión 5s
+    blockFor(BLOCK_AFTER_EXPLOSION_MS);
+
+    // No programamos próxima hasta que vuelvan a empezar a reparar.
   };
 
   const percent = Math.round(progress * 100);
@@ -793,7 +842,7 @@ export default function Engine() {
   // Cooldown patada
   const cooldownSec = (kickCooldownLeftMs / 1000);
   const cooldownLabel = cooldownSec > 0 ? `${cooldownSec.toFixed(1)}s` : "Listo";
-  const kickAreaDisabled = isComplete || cooldownSec > 0 || skillState !== "NONE";
+  const kickAreaDisabled = isComplete || cooldownSec > 0 || skillState !== "NONE" || isBlocked();
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -805,13 +854,13 @@ export default function Engine() {
           style={[
             styles.engineArea,
             isComplete && styles.engineComplete,
-            skillState !== "NONE" && styles.engineSkill,
+            (skillState !== "NONE" || (isBlocked() && !isComplete)) && styles.engineSkill,
           ]}
           collapsable={false}
           onLayout={measureEngineInWindow}
           pointerEvents={isComplete ? "none" : "auto"}
-          onStartShouldSetResponder={() => !isComplete}
-          onMoveShouldSetResponder={() => !isComplete}
+          onStartShouldSetResponder={() => !isComplete && !isBlocked()}
+          onMoveShouldSetResponder={() => !isComplete && !isBlocked()}
           onResponderGrant={updateTouches}
           onResponderMove={updateTouches}
           onResponderRelease={(e) => { updateTouches(e); postReleaseDoubleCheck(); }}
@@ -841,7 +890,7 @@ export default function Engine() {
             )}
             {skillState === "AIM_PENDING" && (
               <View style={styles.skillBadgeDim}>
-                <Text style={styles.skillBadgeTextDim}>Preparados…</Text>
+                <Text style={styles.skillBadgeTextDim}>Preparados… ¡no toquéis aún!</Text>
               </View>
             )}
             {skillState === "AIM_ACTIVE" && (
@@ -850,14 +899,19 @@ export default function Engine() {
               </View>
             )}
 
-            {/* Badge de regresión */}
+            {/* Badges simultáneos: BLOQUEADO y/o REGRESIÓN */}
+            {!isComplete && isBlocked() && (
+              <View style={styles.badgeBlocked}>
+                <Text style={styles.badgeBlockedText}>BLOQUEADO {blockLabel}</Text>
+              </View>
+            )}
             {regressionActive && (
               <View style={styles.regBadge}>
                 <Text style={styles.regBadgeText}>REGRESIÓN</Text>
               </View>
             )}
 
-            {!isComplete && (
+            {!isComplete && !isBlocked() && (
               <Text style={styles.players}>
                 Jugadores reparando: {playersTouching} / {MAX_PLAYERS}
               </Text>
@@ -881,13 +935,15 @@ export default function Engine() {
               <Text style={styles.completeLabel}>¡REPARADO!</Text>
             ) : (
               <Text style={styles.hint}>
-                {skillState === "NONE" ? "Colocad hasta 4 dedos a la vez" : "Habilidad en curso…"}
+                {skillState === "NONE"
+                  ? (isBlocked() ? "Motor bloqueado…" : "Colocad hasta 4 dedos a la vez")
+                  : "Habilidad en curso…"}
               </Text>
             )}
           </View>
 
-          {/* Overlay dedos */}
-          {!isComplete && (
+          {/* Overlay dedos (no mostrar durante bloqueo/skill/completado) */}
+          {!isComplete && !isBlocked() && skillState === "NONE" && (
             <View style={styles.ringsOverlay} pointerEvents="none">
               {touchPoints.map(p => (
                 <View
@@ -901,7 +957,7 @@ export default function Engine() {
             </View>
           )}
 
-          {/* Overlay Círculo Skill */}
+          {/* Overlay Círculo Skill (verde amarillento) */}
           {skillState === "AIM_ACTIVE" && skillTarget && (
             <View style={styles.skillOverlay} pointerEvents="none">
               <View
@@ -918,7 +974,7 @@ export default function Engine() {
         <View
           style={[
             styles.kickArea,
-            (isComplete || cooldownSec > 0 || skillState !== "NONE") && styles.kickDisabled,
+            (isComplete || cooldownSec > 0 || skillState !== "NONE" || isBlocked()) && styles.kickDisabled,
           ]}
           onStartShouldSetResponder={() => !kickAreaDisabled}
           onMoveShouldSetResponder={() => !kickAreaDisabled}
@@ -930,7 +986,13 @@ export default function Engine() {
         >
           <Text style={styles.kickTitle}>PATADA</Text>
           <Text style={styles.kickHint}>
-            {cooldownSec > 0 ? `Espera ${cooldownLabel}` : (skillState !== "NONE" ? "Bloqueado" : "Mantén 3s")}
+            {isComplete
+              ? "Completado"
+              : isBlocked()
+                ? `Bloqueado ${blockLabel}`
+                : cooldownSec > 0
+                  ? `Espera ${cooldownLabel}`
+                  : (skillState !== "NONE" ? "Habilidad en curso" : "Mantén 3s")}
           </Text>
 
           <View style={styles.kickBar}>
@@ -987,6 +1049,16 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(239, 68, 68, 0.15)",
   },
   regBadgeText: { color: "#fca5a5", fontSize: 13, fontWeight: "800", letterSpacing: 1 },
+
+  badgeBlocked: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#6b7280",
+    backgroundColor: "rgba(156,163,175,0.18)",
+  },
+  badgeBlockedText: { color: "#e5e7eb", fontSize: 13, fontWeight: "800", letterSpacing: 1 },
 
   skillBadge: {
     paddingHorizontal: 12,
@@ -1070,7 +1142,7 @@ const styles = StyleSheet.create({
     transform: [{ translateX: -RING_RADIUS }, { translateY: -RING_RADIUS * 1.5 }],
   },
 
-  // Overlay Círculo Skill
+  // Overlay Círculo Skill (verde amarillento)
   skillOverlay: { position: "absolute", left: 0, top: 0, right: 0, bottom: 0, zIndex: 3 },
   skillRing: {
     position: "absolute",
@@ -1078,10 +1150,10 @@ const styles = StyleSheet.create({
     height: SKILL_RING_SIZE,
     borderRadius: SKILL_RING_RADIUS,
     borderWidth: 3,
-    borderColor: "#fbbf24",
-    backgroundColor: "rgba(251,191,36,0.12)",
-    shadowColor: "#fbbf24",
-    shadowOpacity: 0.6,
+    borderColor: "#a3e635", // lime-400
+    backgroundColor: "rgba(163,230,53,0.20)",
+    shadowColor: "#a3e635",
+    shadowOpacity: 0.7,
     shadowRadius: 12,
     shadowOffset: { width: 0, height: 0 },
     transform: [{ translateX: -SKILL_RING_RADIUS }, { translateY: -SKILL_RING_RADIUS }],
