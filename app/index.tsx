@@ -3,8 +3,8 @@
 // Regresión + chispazos (Gen_Spark1..9) 5–7s sin reparar.
 // Multitouch fluido, audio por tramos, completed loop+notif, landscape.
 // Hover centrado, patada con cooldown y tick, Skill Checks estilo DBD (timers separados).
-// BLOQUEO: no permite reparar ni toques, pero **SÍ** deja que la regresión avance.
-// FIX: ventana de gracia tras skill correcta para no disparar bloqueo por “drop”.
+// Menú de AJUSTES (popup) para parametrizar todo. Reset de motor sin tocar ajustes.
+// BLOQUEO: no permite reparar ni toques, pero SÍ deja que la regresión avance.
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
@@ -12,24 +12,21 @@ import { useKeepAwake } from "expo-keep-awake";
 import * as ScreenOrientation from "expo-screen-orientation";
 import React, { useEffect, useRef, useState } from "react";
 import {
-	AppState,
-	findNodeHandle,
-	GestureResponderEvent,
-	SafeAreaView,
-	StatusBar,
-	StyleSheet,
-	Text,
-	UIManager,
-	View,
+  AppState,
+  findNodeHandle,
+  GestureResponderEvent,
+  SafeAreaView,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  UIManager,
+  View,
 } from "react-native";
 
-// ==== Parámetros del juego ====
-const MAX_PLAYERS = 4;
-const SOLO_SECONDS = 80;
-const BOOST_PER_EXTRA = 1;
-const MAX_PLAYER_REPAIR_PENALTY = 0.7;
-
-// ==== Barra ====
+// ==== Barra (visual) ====
 const BAR_H = 22;
 const BAR_R = 12;
 
@@ -46,13 +43,7 @@ const VOL = 0.7;
 const XFADE_MS = 160;
 
 // ==== Patada ====
-const KICK_HOLD_MS = 3000;
-const KICK_COOLDOWN_MS = 20000;
-
-// ==== Bloqueos ====
-const BLOCK_MS_KICK = 15000; // 15s tras patada
-const BLOCK_MS_EXPLODE = 5000; // 5s tras fallo skill
-const BLOCK_MS_DROP = 5000; // 5s si dejan de reparar (no por skill/patada)
+const KICK_HOLD_MS = 3000; // mantener 3s para patear (dejamos fijo en UI por ahora)
 
 const SFX = {
   // Loops progreso
@@ -64,12 +55,15 @@ const SFX = {
   gen3Repair: require("../assets/sfx/Gen3_Repairing.wav"),
   gen4: require("../assets/sfx/Gen4.wav"),
   gen4Repair: require("../assets/sfx/Gen4_Repairing.wav"),
+
   // Completado
   completed: require("../assets/sfx/Generator_Completed.wav"),
   completedNotif: require("../assets/sfx/Generator_Completed_Notification.wav"),
+
   // Patada
   break: require("../assets/sfx/Generator_Break.wav"),
   kickTick: require("../assets/sfx/Gen_Kick.wav"),
+
   // Chispazos
   spark1: require("../assets/sfx/sparks/Gen_Spark1.wav"),
   spark2: require("../assets/sfx/sparks/Gen_Spark2.wav"),
@@ -80,6 +74,7 @@ const SFX = {
   spark7: require("../assets/sfx/sparks/Gen_Spark7.wav"),
   spark8: require("../assets/sfx/sparks/Gen_Spark8.wav"),
   spark9: require("../assets/sfx/sparks/Gen_Spark9.wav"),
+
   // Skill checks
   skillCheck: require("../assets/sfx/Skill_Check.wav"),
   explode: require("../assets/sfx/Gen_Explode.wav"),
@@ -89,8 +84,51 @@ const SFX = {
 type TrackKey = keyof typeof SFX;
 type SkillState = "NONE" | "RELEASE" | "AIM_PENDING" | "AIM_ACTIVE";
 
-function getSpeedMultiplier(players: number) {
-  return Math.pow(players, MAX_PLAYER_REPAIR_PENALTY);
+// ===== AJUSTES =====
+type Settings = {
+  maxPlayers: number;                 // MAX_PLAYERS
+  soloSeconds: number;                // SOLO_SECONDS (s)
+  maxPlayerPenalty: number;           // MAX_PLAYER_REPAIR_PENALTY
+  kickCooldownMs: number;             // KICK_COOLDOWN_MS (ms)
+  blockKickMs: number;                // BLOCK_MS_KICK (ms)
+  blockExplodeMs: number;             // BLOCK_MS_EXPLODE (ms)
+  blockDropMs: number;                // BLOCK_MS_DROP (ms)
+  regressionSpeedMult: number;        // REGRESSION_SPEED_MULT
+  regressionRecoverAmount: number;    // +X (0.05 = 5%)
+  skillMinS: number;                  // skill min (s) desde que empiezan a reparar
+  skillMaxS: number;                  // skill max (s) desde que empiezan a reparar
+  kickStrength: number;               // % progreso que quita la patada (0.20 = 20%)
+  explodeStrength: number;            // % progreso que quita la explosión (0.10 = 10%)
+};
+
+const DEFAULT_SETTINGS: Settings = {
+  maxPlayers: 4,
+  soloSeconds: 80,
+  maxPlayerPenalty: 0.7,
+  kickCooldownMs: 20000,
+  blockKickMs: 15000,
+  blockExplodeMs: 5000,
+  blockDropMs: 5000,
+  regressionSpeedMult: 0.5,
+  regressionRecoverAmount: 0.05,
+  skillMinS: 10,
+  skillMaxS: 15,
+  kickStrength: 0.2,
+  explodeStrength: 0.1,
+};
+
+// ===== Helpers =====
+const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n));
+const toNum = (s: string, def: number) => {
+  const n = parseFloat(s.replace(",", "."));
+  return Number.isFinite(n) ? n : def;
+};
+const toInt = (s: string, def: number) => {
+  const n = parseInt(s, 10);
+  return Number.isFinite(n) ? n : def;
+};
+function getSpeedMultiplier(players: number, penalty: number) {
+  return Math.pow(players, penalty);
 }
 
 async function fadeVolume(sound: Audio.Sound, from: number, to: number, ms: number) {
@@ -111,7 +149,17 @@ export default function Engine() {
     ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE).catch(() => {});
   }, []);
 
-  // Estado principal
+  // ===== Settings (estado + ref rápida) =====
+  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  const settingsRef = useRef<Settings>(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  // ===== Menú de ajustes =====
+  const [showSettings, setShowSettings] = useState(false);
+
+  // ===== Estado principal =====
   const [progress, setProgress] = useState(0);
   const [playersTouching, setPlayersTouching] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
@@ -120,12 +168,10 @@ export default function Engine() {
   const rafRef = useRef<number | null>(null);
   const lastTsRef = useRef<number | null>(null);
 
-  // Regresión
-  const REGRESSION_SPEED_MULT = 0.5;
+  // === Regresión ===
   const regressionActiveRef = useRef(false);
   const [regressionActive, setRegressionActive] = useState(false);
   const regressionRecoverBaselineRef = useRef<number | null>(null);
-  const regressionRecoverAmount = 0.05;
 
   // Pulso visual en regresión
   const [regPulse, setRegPulse] = useState(false);
@@ -250,7 +296,7 @@ export default function Engine() {
     skillStateRef.current = skillState;
   }, [skillState]);
 
-  // Scheduler 10–15s desde que empiezan a reparar
+  // Scheduler desde que empiezan a reparar (min..max s)
   const skillScheduleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clearSkillScheduler = () => {
     if (skillScheduleTimerRef.current) {
@@ -260,11 +306,15 @@ export default function Engine() {
   };
   const scheduleSkillAfterStart = () => {
     clearSkillScheduler();
-    const delay = 10000 + Math.floor(Math.random() * 5000); // 10–15s
+    const { skillMinS, skillMaxS } = settingsRef.current;
+    const min = Math.max(1, Math.min(skillMinS, skillMaxS));
+    const max = Math.max(min, skillMaxS);
+    const delay = (min + Math.random() * (max - min)) * 1000;
     skillScheduleTimerRef.current = setTimeout(tryStartSkill, delay);
   };
   const tryStartSkill = () => {
     skillScheduleTimerRef.current = null;
+    const st = settingsRef.current;
     if (
       !isComplete &&
       !isBlocked() &&
@@ -273,6 +323,8 @@ export default function Engine() {
       skillStateRef.current === "NONE"
     ) {
       startSkillReleasePhase().catch(() => {});
+    } else {
+      // si no se puede, el re-armado llegará cuando cambien las condiciones
     }
   };
 
@@ -324,7 +376,7 @@ export default function Engine() {
       return;
     }
 
-    // Flanco de subida: empiezan a reparar -> arma skill (10–15s)
+    // Flanco de subida: empiezan a reparar -> arma skill (settings.skillMinS..skillMaxS)
     if (!repairingPrev && repairingNow) {
       scheduleSkillAfterStart();
       return;
@@ -335,7 +387,7 @@ export default function Engine() {
       clearSkillScheduler();
       // Bloqueo por drop SOLO si no venimos de skill y no estamos en ventana de gracia
       if (skillStateRef.current === "NONE" && !isComplete && Date.now() >= ignoreDropUntilRef.current) {
-        setBlocked(BLOCK_MS_DROP);
+        setBlocked(settingsRef.current.blockDropMs);
       }
       return;
     }
@@ -360,10 +412,7 @@ export default function Engine() {
   }, [regressionActive, isComplete]);
 
   // --- Progreso + Regresión ---
-  // (skill pausa progreso; bloqueo impide reparar pero permite regresión)
   useEffect(() => {
-    const basePerSecond = 1 / SOLO_SECONDS;
-
     const loop = (ts: number) => {
       if (!lastTsRef.current) lastTsRef.current = ts;
       const dt = Math.min(0.1, (ts - lastTsRef.current) / 1000);
@@ -373,15 +422,17 @@ export default function Engine() {
         if (isComplete) return prev;
         if (skillStateRef.current !== "NONE") return prev;
 
+        const st = settingsRef.current;
+        const basePerSecond = 1 / Math.max(1, st.soloSeconds);
         const repairingAllowed = !isBlocked();
         const effectivePlayers = repairingAllowed ? playersTouching : 0;
 
         let next = prev;
-        const mult = getSpeedMultiplier(effectivePlayers) * BOOST_PER_EXTRA;
+        const mult = getSpeedMultiplier(effectivePlayers, st.maxPlayerPenalty) * 1;
         const repairRate = basePerSecond * mult;
 
         const shouldRegress = regressionActiveRef.current && effectivePlayers === 0;
-        const regressRate = basePerSecond * REGRESSION_SPEED_MULT;
+        const regressRate = basePerSecond * st.regressionSpeedMult;
 
         if (shouldRegress) next = Math.max(0, next - regressRate * dt);
         else next = Math.min(1, next + repairRate * dt);
@@ -393,11 +444,11 @@ export default function Engine() {
           regressionRecoverBaselineRef.current = null;
         }
 
-        // Cancelación de regresión cuando reparan +5%
+        // Cancelación de regresión cuando reparan +X
         if (regressionActiveRef.current && effectivePlayers > 0) {
           if (regressionRecoverBaselineRef.current === null) {
             regressionRecoverBaselineRef.current = next;
-          } else if (next >= regressionRecoverBaselineRef.current + 0.000001 + regressionRecoverAmount) {
+          } else if (next >= regressionRecoverBaselineRef.current + 0.000001 + st.regressionRecoverAmount) {
             regressionActiveRef.current = false;
             setRegressionActive(false);
             regressionRecoverBaselineRef.current = null;
@@ -576,7 +627,7 @@ export default function Engine() {
   const readAllTouches = (evt?: GestureResponderEvent) => {
     const touches = (evt?.nativeEvent as any)?.touches ?? [];
     const { x, y, w, h } = engineRectRef.current;
-    const sliced = touches.slice(0, MAX_PLAYERS);
+    const sliced = touches.slice(0, settingsRef.current.maxPlayers);
     const points = sliced.map((t: any, idx: number) => {
       const px = t.pageX ?? 0;
       const py = t.pageY ?? 0;
@@ -726,17 +777,17 @@ export default function Engine() {
 
         // Acción final de patada
         kickPlayBreak().catch(() => {});
-        setProgress((prev) => Math.max(0, prev - 0.2));
+        setProgress((prev) => Math.max(0, prev - settingsRef.current.kickStrength));
         regressionActiveRef.current = true;
         setRegressionActive(true);
         regressionRecoverBaselineRef.current = null;
 
         // Bloqueo por patada
-        setBlocked(BLOCK_MS_KICK);
+        setBlocked(settingsRef.current.blockKickMs);
 
         // Cooldown
-        nextKickAtRef.current = Date.now() + KICK_COOLDOWN_MS;
-        setKickCooldownLeftMs(KICK_COOLDOWN_MS);
+        nextKickAtRef.current = Date.now() + settingsRef.current.kickCooldownMs;
+        setKickCooldownLeftMs(settingsRef.current.kickCooldownMs);
 
         // Visual reset
         nextKickTickAtRef.current = null;
@@ -794,16 +845,7 @@ export default function Engine() {
   useEffect(() => {
     const sub = AppState.addEventListener("change", (state) => {
       if (state !== "active") {
-        clearTouches();
-        setRepairingSmooth(false);
-        kickReset();
-        regressionActiveRef.current = false;
-        setRegressionActive(false);
-        regressionRecoverBaselineRef.current = null;
-        clearSparkTimer();
-        cancelAllSkillTimers();
-        setSkillState("NONE");
-        setSkillTarget(null);
+        resetEngine();
         setTimeout(measureEngineInWindow, 0);
       }
     });
@@ -812,7 +854,6 @@ export default function Engine() {
 
   // ===== Fases de SKILL =====
   const startSkillReleasePhase = async () => {
-    // Bloquear scheduler durante la prueba
     clearSkillScheduler();
     setSkillState("RELEASE");
     setSkillTarget(null);
@@ -884,11 +925,45 @@ export default function Engine() {
     setSkillState("NONE");
     setSkillTarget(null);
     playOnce("explode").catch(() => {});
-    setProgress((prev) => Math.max(0, prev - 0.1));
+    setProgress((prev) => Math.max(0, prev - settingsRef.current.explodeStrength));
     regressionActiveRef.current = true;
     setRegressionActive(true);
     regressionRecoverBaselineRef.current = null;
-    setBlocked(BLOCK_MS_EXPLODE);
+    setBlocked(settingsRef.current.blockExplodeMs);
+  };
+
+  // ===== Reset motor (sin tocar ajustes) =====
+  const resetEngine = () => {
+    // Estado
+    setIsComplete(false);
+    setProgress(0);
+    clearTouches();
+    setRepairingSmooth(false);
+
+    // Regresión
+    regressionActiveRef.current = false;
+    setRegressionActive(false);
+    regressionRecoverBaselineRef.current = null;
+
+    // Bloqueos
+    blockUntilRef.current = 0;
+    setBlockedLeftMs(0);
+    ignoreDropUntilRef.current = 0;
+
+    // Patada
+    kickReset();
+    nextKickAtRef.current = 0;
+    setKickCooldownLeftMs(0);
+
+    // Skill
+    cancelAllSkillTimers();
+    setSkillState("NONE");
+    setSkillTarget(null);
+
+    // Audio
+    currentRef.current?.stopAsync().catch(() => {});
+    currentRef.current = null;
+    currentKeyRef.current = null;
   };
 
   const percent = Math.round(progress * 100);
@@ -900,9 +975,20 @@ export default function Engine() {
 
   const blockedSec = Math.ceil(blockedLeftMs / 1000);
 
+  // ===== UI =====
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar hidden />
+
+      {/* Botón de Ajustes (esquina superior derecha) */}
+      <TouchableOpacity
+        style={styles.settingsBtn}
+        onPress={() => setShowSettings(true)}
+        accessibilityLabel="Abrir ajustes"
+      >
+        <Text style={styles.settingsBtnText}>⚙️</Text>
+      </TouchableOpacity>
+
       <View style={styles.row}>
         {/* Motor */}
         <View
@@ -977,7 +1063,7 @@ export default function Engine() {
             {/* Jugadores */}
             {!isComplete && !isBlocked() && (
               <Text style={styles.players}>
-                Jugadores reparando: {playersTouching} / {MAX_PLAYERS}
+                Jugadores reparando: {playersTouching} / {settings.maxPlayers}
               </Text>
             )}
 
@@ -1029,8 +1115,7 @@ export default function Engine() {
         <View
           style={[
             styles.kickArea,
-            (isComplete || cooldownSec > 0 || skillState !== "NONE" || isBlocked()) &&
-              styles.kickDisabled,
+            (isComplete || cooldownSec > 0 || skillState !== "NONE" || isBlocked()) && styles.kickDisabled,
           ]}
           onStartShouldSetResponder={() => !kickAreaDisabled}
           onMoveShouldSetResponder={() => !kickAreaDisabled}
@@ -1058,7 +1143,187 @@ export default function Engine() {
           </View>
         </View>
       </View>
+
+      {/* ======= POPUP AJUSTES ======= */}
+      {showSettings && (
+        <View style={styles.modalBackdrop} pointerEvents="auto">
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Ajustes</Text>
+              <TouchableOpacity onPress={() => setShowSettings(false)} accessibilityLabel="Cerrar ajustes">
+                <Text style={styles.modalClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={styles.modalScroll} contentContainerStyle={{ paddingBottom: 20 }}>
+              {/* Helper fila numérica */}
+              <SettingNumber
+                label="Número máximo de jugadores"
+                value={String(settings.maxPlayers)}
+                onChange={(txt) =>
+                  setSettings((s) => ({ ...s, maxPlayers: clamp(toInt(txt, s.maxPlayers), 1, 8) }))
+                }
+                suffix=""
+              />
+
+              <SettingNumber
+                label="Tiempo de reparación base (s)"
+                value={String(settings.soloSeconds)}
+                onChange={(txt) => setSettings((s) => ({ ...s, soloSeconds: clamp(toInt(txt, s.soloSeconds), 5, 600) }))}
+                suffix="s"
+              />
+
+              <SettingNumber
+                label="Penalización de reparación por jugador"
+                value={String(settings.maxPlayerPenalty)}
+                onChange={(txt) =>
+                  setSettings((s) => ({ ...s, maxPlayerPenalty: clamp(toNum(txt, s.maxPlayerPenalty), 0, 2) }))
+                }
+              />
+
+              <SettingNumber
+                label="Enfriamiento de la patada (s)"
+                value={String(Math.round(settings.kickCooldownMs / 1000))}
+                onChange={(txt) =>
+                  setSettings((s) => ({ ...s, kickCooldownMs: clamp(toInt(txt, s.kickCooldownMs / 1000), 0, 600) * 1000 }))
+                }
+                suffix="s"
+              />
+
+              <SettingNumber
+                label="Tiempo de bloqueo por patada (s)"
+                value={String(Math.round(settings.blockKickMs / 1000))}
+                onChange={(txt) =>
+                  setSettings((s) => ({ ...s, blockKickMs: clamp(toInt(txt, s.blockKickMs / 1000), 0, 600) * 1000 }))
+                }
+                suffix="s"
+              />
+
+              <SettingNumber
+                label="Tiempo de bloqueo por explosión (s)"
+                value={String(Math.round(settings.blockExplodeMs / 1000))}
+                onChange={(txt) =>
+                  setSettings((s) => ({ ...s, blockExplodeMs: clamp(toInt(txt, s.blockExplodeMs / 1000), 0, 600) * 1000 }))
+                }
+                suffix="s"
+              />
+
+              <SettingNumber
+                label="Tiempo de bloqueo por abandono (s)"
+                value={String(Math.round(settings.blockDropMs / 1000))}
+                onChange={(txt) =>
+                  setSettings((s) => ({ ...s, blockDropMs: clamp(toInt(txt, s.blockDropMs / 1000), 0, 600) * 1000 }))
+                }
+                suffix="s"
+              />
+
+              <SettingNumber
+                label="Multiplicador de la regresión"
+                value={String(settings.regressionSpeedMult)}
+                onChange={(txt) =>
+                  setSettings((s) => ({ ...s, regressionSpeedMult: clamp(toNum(txt, s.regressionSpeedMult), 0, 5) }))
+                }
+              />
+
+              <SettingNumber
+                label="Recuperación de la regresión (%)"
+                value={String(Math.round(settings.regressionRecoverAmount * 100))}
+                onChange={(txt) =>
+                  setSettings((s) => ({
+                    ...s,
+                    regressionRecoverAmount: clamp(toNum(txt, s.regressionRecoverAmount * 100), 0, 100) / 100,
+                  }))
+                }
+                suffix="%"
+              />
+
+              <SettingNumber
+                label="Skillcheck: tiempo mínimo (s)"
+                value={String(settings.skillMinS)}
+                onChange={(txt) =>
+                  setSettings((s) => {
+                    const min = clamp(toInt(txt, s.skillMinS), 1, 600);
+                    return { ...s, skillMinS: min > s.skillMaxS ? s.skillMaxS : min };
+                  })
+                }
+                suffix="s"
+              />
+
+              <SettingNumber
+                label="Skillcheck: tiempo máximo (s)"
+                value={String(settings.skillMaxS)}
+                onChange={(txt) =>
+                  setSettings((s) => {
+                    const max = clamp(toInt(txt, s.skillMaxS), 1, 600);
+                    return { ...s, skillMaxS: max < s.skillMinS ? s.skillMinS : max };
+                  })
+                }
+                suffix="s"
+              />
+
+              <SettingNumber
+                label="Fuerza de la patada (%)"
+                value={String(Math.round(settings.kickStrength * 100))}
+                onChange={(txt) =>
+                  setSettings((s) => ({
+                    ...s,
+                    kickStrength: clamp(toNum(txt, s.kickStrength * 100), 0, 100) / 100,
+                  }))
+                }
+                suffix="%"
+              />
+
+              <SettingNumber
+                label="Fuerza de la explosión (%)"
+                value={String(Math.round(settings.explodeStrength * 100))}
+                onChange={(txt) =>
+                  setSettings((s) => ({
+                    ...s,
+                    explodeStrength: clamp(toNum(txt, s.explodeStrength * 100), 0, 100) / 100,
+                  }))
+                }
+                suffix="%"
+              />
+
+              {/* Botón de reset motor */}
+              <TouchableOpacity style={styles.resetBtn} onPress={resetEngine}>
+                <Text style={styles.resetBtnText}>Reiniciar motor</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </View>
+        </View>
+      )}
     </SafeAreaView>
+  );
+}
+
+/** === Componente fila de ajuste numérico simple === */
+function SettingNumber({
+  label,
+  value,
+  onChange,
+  suffix,
+}: {
+  label: string;
+  value: string;
+  onChange: (txt: string) => void;
+  suffix?: string;
+}) {
+  return (
+    <View style={styles.settingRow}>
+      <Text style={styles.settingLabel}>{label}</Text>
+      <View style={styles.settingInputWrap}>
+        <TextInput
+          style={styles.settingInput}
+          keyboardType="numeric"
+          value={value}
+          onChangeText={onChange}
+          placeholder=""
+          placeholderTextColor="#64748b"
+        />
+        {suffix ? <Text style={styles.settingSuffix}>{suffix}</Text> : null}
+      </View>
+    </View>
   );
 }
 
@@ -1244,4 +1509,93 @@ const styles = StyleSheet.create({
     justifyContent: "flex-end",
   },
   kickFill: { width: "100%", backgroundColor: "#ef4444" },
+
+  // Settings button
+  settingsBtn: {
+    position: "absolute",
+    top: 8,
+    right: 8,
+    zIndex: 20,
+    backgroundColor: "rgba(30,41,59,0.7)",
+    borderColor: "#475569",
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  settingsBtnText: { color: "#e2e8f0", fontSize: 16 },
+
+  // Modal ajustes
+  modalBackdrop: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 30,
+    paddingHorizontal: 12,
+  },
+  modalCard: {
+    width: "92%",
+    maxWidth: 640,
+    maxHeight: "86%",
+    backgroundColor: "#0b0f14",
+    borderColor: "#334155",
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+  },
+  modalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
+    paddingHorizontal: 4,
+  },
+  modalTitle: { color: "#e5e7eb", fontSize: 18, fontWeight: "800", letterSpacing: 0.5 },
+  modalClose: { color: "#94a3b8", fontSize: 20, padding: 6 },
+
+  modalScroll: {
+    borderTopWidth: 1,
+    borderTopColor: "#1f2937",
+    paddingTop: 10,
+  },
+
+  settingRow: {
+    marginBottom: 12,
+    gap: 6,
+  },
+  settingLabel: { color: "#cbd5e1", fontSize: 14, fontWeight: "600" },
+  settingInputWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#0f172a",
+    borderColor: "#334155",
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  settingInput: {
+    flex: 1,
+    color: "#e5e7eb",
+    fontSize: 16,
+    paddingVertical: 6,
+    paddingHorizontal: 6,
+  },
+  settingSuffix: { color: "#94a3b8", fontSize: 14, marginLeft: 8 },
+
+  resetBtn: {
+    marginTop: 6,
+    backgroundColor: "#1e293b",
+    borderColor: "#475569",
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: "center",
+  },
+  resetBtnText: { color: "#e2e8f0", fontSize: 16, fontWeight: "700" },
 });
