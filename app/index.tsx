@@ -3,8 +3,10 @@
 // Regresión + chispazos (Gen_Spark1..9) 5–7s sin reparar.
 // Multitouch fluido, audio por tramos, completed loop+notif, landscape.
 // Hover centrado, patada con cooldown y tick, Skill Checks estilo DBD (timers separados).
-// Menú de AJUSTES (popup) para parametrizar todo. Reset de motor sin tocar ajustes.
+// Menú de AJUSTES (popup) con borrador editable y botón “Aplicar cambios”. Reset de motor sin tocar ajustes.
 // BLOQUEO: no permite reparar ni toques, pero SÍ deja que la regresión avance.
+// Toast propio (multiplataforma) para confirmar acciones.
+// Marca de umbral de recuperación durante la regresión.
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
@@ -43,8 +45,9 @@ const VOL = 0.7;
 const XFADE_MS = 160;
 
 // ==== Patada ====
-const KICK_HOLD_MS = 3000; // mantener 3s para patear (dejamos fijo en UI por ahora)
+const KICK_HOLD_MS = 3000; // mantener 3s para patear (fijo)
 
+// ==== SFX ====
 const SFX = {
   // Loops progreso
   gen1: require("../assets/sfx/Gen1.wav"),
@@ -90,45 +93,120 @@ type Settings = {
   soloSeconds: number;                // SOLO_SECONDS (s)
   maxPlayerPenalty: number;           // MAX_PLAYER_REPAIR_PENALTY
   kickCooldownMs: number;             // KICK_COOLDOWN_MS (ms)
-  blockKickMs: number;                // BLOCK_MS_KICK (ms)
-  blockExplodeMs: number;             // BLOCK_MS_EXPLODE (ms)
-  blockDropMs: number;                // BLOCK_MS_DROP (ms)
+  blockKickMs: number;                // BLOQUEO por patada
+  blockExplodeMs: number;             // BLOQUEO por explosión
+  blockDropMs: number;                // BLOQUEO por abandono
   regressionSpeedMult: number;        // REGRESSION_SPEED_MULT
-  regressionRecoverAmount: number;    // +X (0.05 = 5%)
+  regressionRecoverAmount: number;    // +X (0.06 = 6%)
   skillMinS: number;                  // skill min (s) desde que empiezan a reparar
-  skillMaxS: number;                  // skill max (s) desde que empiezan a reparar
+  skillMaxS: number;                  // skill max (s)
   kickStrength: number;               // % progreso que quita la patada (0.20 = 20%)
   explodeStrength: number;            // % progreso que quita la explosión (0.10 = 10%)
 };
 
+// >>> Valores predeterminados ACTUALIZADOS <<<
 const DEFAULT_SETTINGS: Settings = {
   maxPlayers: 4,
-  soloSeconds: 80,
-  maxPlayerPenalty: 0.7,
-  kickCooldownMs: 20000,
-  blockKickMs: 15000,
-  blockExplodeMs: 5000,
+  soloSeconds: 240,
+  maxPlayerPenalty: 0.5,
+  kickCooldownMs: 25000,
+  blockKickMs: 20000,
+  blockExplodeMs: 8000,
   blockDropMs: 5000,
   regressionSpeedMult: 0.5,
-  regressionRecoverAmount: 0.05,
-  skillMinS: 10,
-  skillMaxS: 15,
+  regressionRecoverAmount: 0.06,
+  skillMinS: 15,
+  skillMaxS: 25,
   kickStrength: 0.2,
   explodeStrength: 0.1,
 };
 
-// ===== Helpers =====
+// Borrador (strings, permiten vacío)
+type SettingsDraft = {
+  maxPlayers: string;
+  soloSeconds: string;
+  maxPlayerPenalty: string;
+  kickCooldownS: string;
+  blockKickS: string;
+  blockExplodeS: string;
+  blockDropS: string;
+  regressionSpeedMult: string;
+  regressionRecoverPercent: string;
+  skillMinS: string;
+  skillMaxS: string;
+  kickStrengthPercent: string;
+  explodeStrengthPercent: string;
+};
+
+// Helpers
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n));
-const toNum = (s: string, def: number) => {
+const toNum = (s: string | undefined, def: number) => {
+  if (s == null || s.trim() === "") return def;
   const n = parseFloat(s.replace(",", "."));
   return Number.isFinite(n) ? n : def;
 };
-const toInt = (s: string, def: number) => {
+const toInt = (s: string | undefined, def: number) => {
+  if (s == null || s.trim() === "") return def;
   const n = parseInt(s, 10);
   return Number.isFinite(n) ? n : def;
 };
 function getSpeedMultiplier(players: number, penalty: number) {
   return Math.pow(players, penalty);
+}
+function settingsToDraft(s: Settings): SettingsDraft {
+  return {
+    maxPlayers: String(s.maxPlayers),
+    soloSeconds: String(s.soloSeconds),
+    maxPlayerPenalty: String(s.maxPlayerPenalty),
+    kickCooldownS: String(Math.round(s.kickCooldownMs / 1000)),
+    blockKickS: String(Math.round(s.blockKickMs / 1000)),
+    blockExplodeS: String(Math.round(s.blockExplodeMs / 1000)),
+    blockDropS: String(Math.round(s.blockDropMs / 1000)),
+    regressionSpeedMult: String(s.regressionSpeedMult),
+    regressionRecoverPercent: String(Math.round(s.regressionRecoverAmount * 100)),
+    skillMinS: String(s.skillMinS),
+    skillMaxS: String(s.skillMaxS),
+    kickStrengthPercent: String(Math.round(s.kickStrength * 100)),
+    explodeStrengthPercent: String(Math.round(s.explodeStrength * 100)),
+  };
+}
+function draftToSettings(d: SettingsDraft, current: Settings): Settings {
+  // Usa 'current' como fallback para vacíos
+  let maxPlayers = clamp(toInt(d.maxPlayers, current.maxPlayers), 1, 8);
+  let soloSeconds = clamp(toInt(d.soloSeconds, current.soloSeconds), 5, 600);
+  let maxPlayerPenalty = clamp(toNum(d.maxPlayerPenalty, current.maxPlayerPenalty), 0, 2);
+
+  let kickCooldownMs = clamp(toInt(d.kickCooldownS, Math.round(current.kickCooldownMs / 1000)), 0, 600) * 1000;
+  let blockKickMs = clamp(toInt(d.blockKickS, Math.round(current.blockKickMs / 1000)), 0, 600) * 1000;
+  let blockExplodeMs = clamp(toInt(d.blockExplodeS, Math.round(current.blockExplodeMs / 1000)), 0, 600) * 1000;
+  let blockDropMs = clamp(toInt(d.blockDropS, Math.round(current.blockDropMs / 1000)), 0, 600) * 1000;
+
+  let regressionSpeedMult = clamp(toNum(d.regressionSpeedMult, current.regressionSpeedMult), 0, 5);
+  let regressionRecoverAmount =
+    clamp(toNum(d.regressionRecoverPercent, current.regressionRecoverAmount * 100), 0, 100) / 100;
+
+  let skillMinS = clamp(toInt(d.skillMinS, current.skillMinS), 1, 600);
+  let skillMaxS = clamp(toInt(d.skillMaxS, current.skillMaxS), 1, 600);
+  if (skillMaxS < skillMinS) skillMaxS = skillMinS;
+
+  let kickStrength = clamp(toNum(d.kickStrengthPercent, current.kickStrength * 100), 0, 100) / 100;
+  let explodeStrength = clamp(toNum(d.explodeStrengthPercent, current.explodeStrength * 100), 0, 100) / 100;
+
+  return {
+    maxPlayers,
+    soloSeconds,
+    maxPlayerPenalty,
+    kickCooldownMs,
+    blockKickMs,
+    blockExplodeMs,
+    blockDropMs,
+    regressionSpeedMult,
+    regressionRecoverAmount,
+    skillMinS,
+    skillMaxS,
+    kickStrength,
+    explodeStrength,
+  };
 }
 
 async function fadeVolume(sound: Audio.Sound, from: number, to: number, ms: number) {
@@ -144,26 +222,57 @@ async function fadeVolume(sound: Audio.Sound, from: number, to: number, ms: numb
 export default function Engine() {
   useKeepAwake();
 
-  // Bloqueo landscape
   useEffect(() => {
     ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE).catch(() => {});
   }, []);
 
-  // ===== Settings (estado + ref rápida) =====
+  // ===== Toast =====
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = (msg: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast(msg);
+    toastTimerRef.current = setTimeout(() => setToast(null), 1600);
+  };
+
+  // ===== Settings =====
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const settingsRef = useRef<Settings>(settings);
-  useEffect(() => {
-    settingsRef.current = settings;
-  }, [settings]);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
 
-  // ===== Menú de ajustes =====
+  // Borrador de ajustes para el popup
+  const [draft, setDraft] = useState<SettingsDraft>(settingsToDraft(DEFAULT_SETTINGS));
   const [showSettings, setShowSettings] = useState(false);
+  useEffect(() => {
+    if (showSettings) {
+      setDraft(settingsToDraft(settingsRef.current));
+    }
+  }, [showSettings]);
 
-  // ===== Estado principal =====
   const [progress, setProgress] = useState(0);
   const [playersTouching, setPlayersTouching] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
   const [touchPoints, setTouchPoints] = useState<{ id: number; x: number; y: number }[]>([]);
+
+  const applyDraft = async () => {
+    const next = draftToSettings(draft, settingsRef.current);
+    setSettings(next);
+    try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); } catch {}
+    showToast("Ajustes aplicados");
+    setShowSettings(false); // <- cerrar popup al aplicar
+
+    // Si ahora mismo están reparando y se puede programar skill, re-arma el temporizador
+    if (
+      !isComplete &&
+      !isBlocked() &&
+      !regressionActiveRef.current &&
+      playersTouchingRef.current > 0 &&
+      skillStateRef.current === "NONE"
+    ) {
+      clearSkillScheduler();
+      scheduleSkillAfterStart();
+    }
+  };
 
   const rafRef = useRef<number | null>(null);
   const lastTsRef = useRef<number | null>(null);
@@ -204,9 +313,7 @@ export default function Engine() {
   // Refs quick
   const lastNativeTouchesCountRef = useRef(0);
   const playersTouchingRef = useRef(0);
-  useEffect(() => {
-    playersTouchingRef.current = playersTouching;
-  }, [playersTouching]);
+  useEffect(() => { playersTouchingRef.current = playersTouching; }, [playersTouching]);
 
   // Layout del motor
   const engineRef = useRef<View | null>(null);
@@ -258,9 +365,7 @@ export default function Engine() {
         }
       } catch {}
     })();
-    return () => {
-      mounted = false;
-    };
+    return () => { mounted = false; };
   }, []);
 
   // ==== BLOQUEO ====
@@ -292,9 +397,7 @@ export default function Engine() {
   // === Skill state machine ===
   const [skillState, setSkillState] = useState<SkillState>("NONE");
   const skillStateRef = useRef<SkillState>("NONE");
-  useEffect(() => {
-    skillStateRef.current = skillState;
-  }, [skillState]);
+  useEffect(() => { skillStateRef.current = skillState; }, [skillState]);
 
   // Scheduler desde que empiezan a reparar (min..max s)
   const skillScheduleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -314,7 +417,6 @@ export default function Engine() {
   };
   const tryStartSkill = () => {
     skillScheduleTimerRef.current = null;
-    const st = settingsRef.current;
     if (
       !isComplete &&
       !isBlocked() &&
@@ -323,8 +425,6 @@ export default function Engine() {
       skillStateRef.current === "NONE"
     ) {
       startSkillReleasePhase().catch(() => {});
-    } else {
-      // si no se puede, el re-armado llegará cuando cambien las condiciones
     }
   };
 
@@ -334,34 +434,17 @@ export default function Engine() {
   const aimAppearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aimDeadlineRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clearSkillPhaseTimers = () => {
-    if (releaseTimerRef.current) {
-      clearTimeout(releaseTimerRef.current);
-      releaseTimerRef.current = null;
-    }
-    if (aimArmDelayRef.current) {
-      clearTimeout(aimArmDelayRef.current);
-      aimArmDelayRef.current = null;
-    }
-    if (aimAppearTimerRef.current) {
-      clearTimeout(aimAppearTimerRef.current);
-      aimAppearTimerRef.current = null;
-    }
-    if (aimDeadlineRef.current) {
-      clearTimeout(aimDeadlineRef.current);
-      aimDeadlineRef.current = null;
-    }
+    if (releaseTimerRef.current) { clearTimeout(releaseTimerRef.current); releaseTimerRef.current = null; }
+    if (aimArmDelayRef.current) { clearTimeout(aimArmDelayRef.current); aimArmDelayRef.current = null; }
+    if (aimAppearTimerRef.current) { clearTimeout(aimAppearTimerRef.current); aimAppearTimerRef.current = null; }
+    if (aimDeadlineRef.current) { clearTimeout(aimDeadlineRef.current); aimDeadlineRef.current = null; }
   };
-  const cancelAllSkillTimers = () => {
-    clearSkillScheduler();
-    clearSkillPhaseTimers();
-  };
+  const cancelAllSkillTimers = () => { clearSkillScheduler(); clearSkillPhaseTimers(); };
 
   // Target AIM
   const [skillTarget, setSkillTarget] = useState<{ x: number; y: number } | null>(null);
   const skillTargetRef = useRef<{ x: number; y: number } | null>(null);
-  useEffect(() => {
-    skillTargetRef.current = skillTarget;
-  }, [skillTarget]);
+  useEffect(() => { skillTargetRef.current = skillTarget; }, [skillTarget]);
   const aimHandledRef = useRef(false);
 
   // Programación por empezar/dejar de reparar
@@ -376,24 +459,23 @@ export default function Engine() {
       return;
     }
 
-    // Flanco de subida: empiezan a reparar -> arma skill (settings.skillMinS..skillMaxS)
     if (!repairingPrev && repairingNow) {
       scheduleSkillAfterStart();
       return;
     }
 
-    // Flanco de bajada: dejan de reparar -> cancela y bloquea (si aplica)
     if (repairingPrev && !repairingNow) {
       clearSkillScheduler();
       // Bloqueo por drop SOLO si no venimos de skill y no estamos en ventana de gracia
       if (skillStateRef.current === "NONE" && !isComplete && Date.now() >= ignoreDropUntilRef.current) {
         setBlocked(settingsRef.current.blockDropMs);
+        showToast("Bloqueado por abandono");
       }
       return;
     }
   }, [playersTouching, isComplete, skillState]);
 
-  // Re-armar skill cuando acaba la regresión mientras hay reparación
+  // Re-armar skill al terminar la regresión si están reparando
   const prevRegressionRef = useRef(regressionActive);
   useEffect(() => {
     const prev = prevRegressionRef.current;
@@ -437,14 +519,12 @@ export default function Engine() {
         if (shouldRegress) next = Math.max(0, next - regressRate * dt);
         else next = Math.min(1, next + repairRate * dt);
 
-        // Si llega a 0%, apagar regresión
         if (next <= 0) {
           regressionActiveRef.current = false;
           setRegressionActive(false);
           regressionRecoverBaselineRef.current = null;
         }
 
-        // Cancelación de regresión cuando reparan +X
         if (regressionActiveRef.current && effectivePlayers > 0) {
           if (regressionRecoverBaselineRef.current === null) {
             regressionRecoverBaselineRef.current = next;
@@ -463,9 +543,7 @@ export default function Engine() {
     };
 
     rafRef.current = requestAnimationFrame(loop);
-    return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    };
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [playersTouching, isComplete]);
 
   const triggerComplete = async () => {
@@ -477,9 +555,7 @@ export default function Engine() {
     setRegressionActive(false);
     regressionRecoverBaselineRef.current = null;
 
-    try {
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } catch {}
+    try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
     await crossfadeTo("completed");
     await playCompletedNotificationOnce();
 
@@ -497,14 +573,8 @@ export default function Engine() {
 
     const raw = playersTouching > 0;
 
-    if (onTimerRef.current) {
-      clearTimeout(onTimerRef.current);
-      onTimerRef.current = null;
-    }
-    if (offTimerRef.current) {
-      clearTimeout(offTimerRef.current);
-      offTimerRef.current = null;
-    }
+    if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
+    if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
 
     if (raw) {
       if (!repairingSmooth) {
@@ -523,26 +593,14 @@ export default function Engine() {
     }
 
     return () => {
-      if (onTimerRef.current) {
-        clearTimeout(onTimerRef.current);
-        onTimerRef.current = null;
-      }
-      if (offTimerRef.current) {
-        clearTimeout(offTimerRef.current);
-        offTimerRef.current = null;
-      }
+      if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
+      if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
     };
   }, [playersTouching, repairingSmooth, isComplete]);
 
   const clearRepairingTimers = () => {
-    if (onTimerRef.current) {
-      clearTimeout(onTimerRef.current);
-      onTimerRef.current = null;
-    }
-    if (offTimerRef.current) {
-      clearTimeout(offTimerRef.current);
-      offTimerRef.current = null;
-    }
+    if (onTimerRef.current) { clearTimeout(onTimerRef.current); onTimerRef.current = null; }
+    if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
   };
 
   const playCompletedNotificationOnce = async () => {
@@ -640,16 +698,14 @@ export default function Engine() {
   };
 
   const applyTouches = (points: { id: number; x: number; y: number }[]) => {
-    // Si está bloqueado, no aceptamos toques ni mostramos hover
     if (isBlocked()) {
       clearTouches();
       return;
     }
-
     setTouchPoints(points);
     setPlayersTouching(points.length);
 
-    // Intento durante AIM_ACTIVE
+    // Éxito/fallo durante AIM_ACTIVE
     if (skillStateRef.current === "AIM_ACTIVE" && !aimHandledRef.current) {
       if (points.length > 0) {
         let hit = false;
@@ -670,7 +726,7 @@ export default function Engine() {
       }
     }
 
-    // Intento prohibido durante AIM_PENDING: tocar antes de que salga el círculo => explota
+    // Tocar antes de que salga el círculo (AIM_PENDING) => explota
     if (skillStateRef.current === "AIM_PENDING" && points.length > 0) {
       handleSkillFail();
     }
@@ -775,21 +831,18 @@ export default function Engine() {
         kickRafRef.current = null;
         setKickHold(1);
 
-        // Acción final de patada
         kickPlayBreak().catch(() => {});
         setProgress((prev) => Math.max(0, prev - settingsRef.current.kickStrength));
         regressionActiveRef.current = true;
         setRegressionActive(true);
         regressionRecoverBaselineRef.current = null;
 
-        // Bloqueo por patada
         setBlocked(settingsRef.current.blockKickMs);
+        showToast("Bloqueado por patada");
 
-        // Cooldown
         nextKickAtRef.current = Date.now() + settingsRef.current.kickCooldownMs;
         setKickCooldownLeftMs(settingsRef.current.kickCooldownMs);
 
-        // Visual reset
         nextKickTickAtRef.current = null;
         setTimeout(() => setKickHold(0), 120);
         return;
@@ -865,10 +918,8 @@ export default function Engine() {
     if (releaseTimerRef.current) clearTimeout(releaseTimerRef.current);
     releaseTimerRef.current = setTimeout(() => {
       if (playersTouchingRef.current > 0) {
-        // No soltaron -> fallo
         handleSkillFail();
       } else {
-        // Pasaron release: espera 1s, y aparece el círculo aleatoriamente en 0–5s
         setSkillState("AIM_PENDING");
         if (aimArmDelayRef.current) clearTimeout(aimArmDelayRef.current);
         aimArmDelayRef.current = setTimeout(() => {
@@ -883,7 +934,6 @@ export default function Engine() {
   };
 
   const startSkillAimActive = () => {
-    // Posición aleatoria dentro del motor
     const { w, h } = engineRectRef.current;
     const pad = SKILL_RING_RADIUS + 8;
     const x = pad + Math.random() * Math.max(1, w - 2 * pad);
@@ -893,7 +943,6 @@ export default function Engine() {
     aimHandledRef.current = false;
     setSkillState("AIM_ACTIVE");
 
-    // 1s de ventana para acertar
     if (aimDeadlineRef.current) clearTimeout(aimDeadlineRef.current);
     aimDeadlineRef.current = setTimeout(() => {
       if (!aimHandledRef.current) {
@@ -908,7 +957,6 @@ export default function Engine() {
     setSkillTarget(null);
     playOnce("good").catch(() => {});
 
-    // Ventana de gracia para no bloquear por drop justo tras acertar
     markIgnoreDrop(1500);
 
     setProgress((prev) => {
@@ -916,8 +964,6 @@ export default function Engine() {
       if (next >= 1 && !isComplete) setTimeout(() => triggerComplete(), 0);
       return next;
     });
-
-    // La siguiente skill se arma cuando vuelvan a empezar a reparar.
   };
 
   const handleSkillFail = () => {
@@ -930,40 +976,38 @@ export default function Engine() {
     setRegressionActive(true);
     regressionRecoverBaselineRef.current = null;
     setBlocked(settingsRef.current.blockExplodeMs);
+    showToast("Bloqueado por explosión");
   };
 
   // ===== Reset motor (sin tocar ajustes) =====
   const resetEngine = () => {
-    // Estado
     setIsComplete(false);
     setProgress(0);
     clearTouches();
     setRepairingSmooth(false);
 
-    // Regresión
     regressionActiveRef.current = false;
     setRegressionActive(false);
     regressionRecoverBaselineRef.current = null;
 
-    // Bloqueos
     blockUntilRef.current = 0;
     setBlockedLeftMs(0);
     ignoreDropUntilRef.current = 0;
 
-    // Patada
     kickReset();
     nextKickAtRef.current = 0;
     setKickCooldownLeftMs(0);
 
-    // Skill
     cancelAllSkillTimers();
     setSkillState("NONE");
     setSkillTarget(null);
 
-    // Audio
     currentRef.current?.stopAsync().catch(() => {});
     currentRef.current = null;
     currentKeyRef.current = null;
+
+    setShowSettings(false); // <- cerrar popup al reiniciar
+    showToast("Motor reiniciado");
   };
 
   const percent = Math.round(progress * 100);
@@ -974,6 +1018,15 @@ export default function Engine() {
   const kickAreaDisabled = isComplete || cooldownSec > 0 || skillState !== "NONE" || isBlocked();
 
   const blockedSec = Math.ceil(blockedLeftMs / 1000);
+
+  // ==== MARCA DE UMBRAL DE RECUPERACIÓN (regresión) ====
+  // Se muestra mientras HAY regresión y los jugadores han empezado a reparar de nuevo.
+  let recoverMarkLeftPct: string | null = null;
+  if (regressionActive && playersTouching > 0) {
+    const base = regressionRecoverBaselineRef.current ?? progress;
+    const thr = Math.min(1, base + settingsRef.current.regressionRecoverAmount);
+    recoverMarkLeftPct = `${thr * 100}%`;
+  }
 
   // ===== UI =====
   return (
@@ -988,6 +1041,13 @@ export default function Engine() {
       >
         <Text style={styles.settingsBtnText}>⚙️</Text>
       </TouchableOpacity>
+
+      {/* Toast */}
+      {toast && (
+        <View style={styles.toast}>
+          <Text style={styles.toastText}>{toast}</Text>
+        </View>
+      )}
 
       <View style={styles.row}>
         {/* Motor */}
@@ -1005,13 +1065,8 @@ export default function Engine() {
           onMoveShouldSetResponder={() => !isComplete && !isBlocked()}
           onResponderGrant={updateTouches}
           onResponderMove={updateTouches}
-          onResponderRelease={(e) => {
-            updateTouches(e);
-            postReleaseDoubleCheck();
-          }}
-          onResponderTerminate={() => {
-            clearTouches();
-          }}
+          onResponderRelease={(e) => { updateTouches(e); postReleaseDoubleCheck(); }}
+          onResponderTerminate={() => { clearTouches(); }}
           onTouchEndCapture={(e) => {
             const pts = readAllTouches(e);
             if (pts.length === 0) clearTouches();
@@ -1060,7 +1115,7 @@ export default function Engine() {
               </View>
             )}
 
-            {/* Jugadores */}
+            {/* Jugadores (oculto si está bloqueado) */}
             {!isComplete && !isBlocked() && (
               <Text style={styles.players}>
                 Jugadores reparando: {playersTouching} / {settings.maxPlayers}
@@ -1077,6 +1132,11 @@ export default function Engine() {
               needsOffscreenAlphaCompositing
             >
               <View style={[styles.progressFill, { width: `${percent}%` }]} />
+
+              {/* Marca de umbral para quitar regresión */}
+              {recoverMarkLeftPct && (
+                <View style={[styles.regressionMark, { left: recoverMarkLeftPct }]} />
+              )}
             </View>
 
             <Text style={styles.percent}>{percent}%</Text>
@@ -1088,7 +1148,7 @@ export default function Engine() {
                 {skillState === "NONE"
                   ? isBlocked()
                     ? "Bloqueado…"
-                    : "Colocad hasta 4 dedos a la vez"
+                    : `Colocad hasta ${settings.maxPlayers} dedos a la vez`
                   : "Habilidad en curso…"}
               </Text>
             )}
@@ -1103,7 +1163,7 @@ export default function Engine() {
             </View>
           )}
 
-          {/* Overlay Círculo Skill */}
+          {/* Overlay Círculo Skill (verde amarillento) */}
           {skillState === "AIM_ACTIVE" && skillTarget && (
             <View style={styles.skillOverlay} pointerEvents="none">
               <View style={[styles.skillRing, { left: skillTarget.x, top: skillTarget.y }]} />
@@ -1119,9 +1179,7 @@ export default function Engine() {
           ]}
           onStartShouldSetResponder={() => !kickAreaDisabled}
           onMoveShouldSetResponder={() => !kickAreaDisabled}
-          onResponderGrant={() => {
-            if (!kickAreaDisabled) onKickStart();
-          }}
+          onResponderGrant={() => { if (!kickAreaDisabled) onKickStart(); }}
           onResponderRelease={onKickEnd}
           onResponderTerminate={onKickEnd}
           accessible
@@ -1155,137 +1213,103 @@ export default function Engine() {
               </TouchableOpacity>
             </View>
 
-            <ScrollView style={styles.modalScroll} contentContainerStyle={{ paddingBottom: 20 }}>
-              {/* Helper fila numérica */}
+            <ScrollView style={styles.modalScroll} contentContainerStyle={{ paddingBottom: 24 }}>
+              {/* Campos */}
               <SettingNumber
                 label="Número máximo de jugadores"
-                value={String(settings.maxPlayers)}
-                onChange={(txt) =>
-                  setSettings((s) => ({ ...s, maxPlayers: clamp(toInt(txt, s.maxPlayers), 1, 8) }))
-                }
+                value={draft.maxPlayers}
+                onChange={(txt) => setDraft((d) => ({ ...d, maxPlayers: txt }))}
                 suffix=""
+                keyboard="number-pad"
               />
-
               <SettingNumber
                 label="Tiempo de reparación base (s)"
-                value={String(settings.soloSeconds)}
-                onChange={(txt) => setSettings((s) => ({ ...s, soloSeconds: clamp(toInt(txt, s.soloSeconds), 5, 600) }))}
+                value={draft.soloSeconds}
+                onChange={(txt) => setDraft((d) => ({ ...d, soloSeconds: txt }))}
                 suffix="s"
+                keyboard="number-pad"
               />
-
               <SettingNumber
                 label="Penalización de reparación por jugador"
-                value={String(settings.maxPlayerPenalty)}
-                onChange={(txt) =>
-                  setSettings((s) => ({ ...s, maxPlayerPenalty: clamp(toNum(txt, s.maxPlayerPenalty), 0, 2) }))
-                }
+                value={draft.maxPlayerPenalty}
+                onChange={(txt) => setDraft((d) => ({ ...d, maxPlayerPenalty: txt }))}
+                keyboard="decimal-pad"
               />
-
               <SettingNumber
                 label="Enfriamiento de la patada (s)"
-                value={String(Math.round(settings.kickCooldownMs / 1000))}
-                onChange={(txt) =>
-                  setSettings((s) => ({ ...s, kickCooldownMs: clamp(toInt(txt, s.kickCooldownMs / 1000), 0, 600) * 1000 }))
-                }
+                value={draft.kickCooldownS}
+                onChange={(txt) => setDraft((d) => ({ ...d, kickCooldownS: txt }))}
                 suffix="s"
+                keyboard="number-pad"
               />
-
               <SettingNumber
                 label="Tiempo de bloqueo por patada (s)"
-                value={String(Math.round(settings.blockKickMs / 1000))}
-                onChange={(txt) =>
-                  setSettings((s) => ({ ...s, blockKickMs: clamp(toInt(txt, s.blockKickMs / 1000), 0, 600) * 1000 }))
-                }
+                value={draft.blockKickS}
+                onChange={(txt) => setDraft((d) => ({ ...d, blockKickS: txt }))}
                 suffix="s"
+                keyboard="number-pad"
               />
-
               <SettingNumber
                 label="Tiempo de bloqueo por explosión (s)"
-                value={String(Math.round(settings.blockExplodeMs / 1000))}
-                onChange={(txt) =>
-                  setSettings((s) => ({ ...s, blockExplodeMs: clamp(toInt(txt, s.blockExplodeMs / 1000), 0, 600) * 1000 }))
-                }
+                value={draft.blockExplodeS}
+                onChange={(txt) => setDraft((d) => ({ ...d, blockExplodeS: txt }))}
                 suffix="s"
+                keyboard="number-pad"
               />
-
               <SettingNumber
                 label="Tiempo de bloqueo por abandono (s)"
-                value={String(Math.round(settings.blockDropMs / 1000))}
-                onChange={(txt) =>
-                  setSettings((s) => ({ ...s, blockDropMs: clamp(toInt(txt, s.blockDropMs / 1000), 0, 600) * 1000 }))
-                }
+                value={draft.blockDropS}
+                onChange={(txt) => setDraft((d) => ({ ...d, blockDropS: txt }))}
                 suffix="s"
+                keyboard="number-pad"
               />
-
               <SettingNumber
                 label="Multiplicador de la regresión"
-                value={String(settings.regressionSpeedMult)}
-                onChange={(txt) =>
-                  setSettings((s) => ({ ...s, regressionSpeedMult: clamp(toNum(txt, s.regressionSpeedMult), 0, 5) }))
-                }
+                value={draft.regressionSpeedMult}
+                onChange={(txt) => setDraft((d) => ({ ...d, regressionSpeedMult: txt }))}
+                keyboard="decimal-pad"
               />
-
               <SettingNumber
                 label="Recuperación de la regresión (%)"
-                value={String(Math.round(settings.regressionRecoverAmount * 100))}
-                onChange={(txt) =>
-                  setSettings((s) => ({
-                    ...s,
-                    regressionRecoverAmount: clamp(toNum(txt, s.regressionRecoverAmount * 100), 0, 100) / 100,
-                  }))
-                }
+                value={draft.regressionRecoverPercent}
+                onChange={(txt) => setDraft((d) => ({ ...d, regressionRecoverPercent: txt }))}
                 suffix="%"
+                keyboard="decimal-pad"
               />
-
               <SettingNumber
                 label="Skillcheck: tiempo mínimo (s)"
-                value={String(settings.skillMinS)}
-                onChange={(txt) =>
-                  setSettings((s) => {
-                    const min = clamp(toInt(txt, s.skillMinS), 1, 600);
-                    return { ...s, skillMinS: min > s.skillMaxS ? s.skillMaxS : min };
-                  })
-                }
+                value={draft.skillMinS}
+                onChange={(txt) => setDraft((d) => ({ ...d, skillMinS: txt }))}
                 suffix="s"
+                keyboard="number-pad"
               />
-
               <SettingNumber
                 label="Skillcheck: tiempo máximo (s)"
-                value={String(settings.skillMaxS)}
-                onChange={(txt) =>
-                  setSettings((s) => {
-                    const max = clamp(toInt(txt, s.skillMaxS), 1, 600);
-                    return { ...s, skillMaxS: max < s.skillMinS ? s.skillMinS : max };
-                  })
-                }
+                value={draft.skillMaxS}
+                onChange={(txt) => setDraft((d) => ({ ...d, skillMaxS: txt }))}
                 suffix="s"
+                keyboard="number-pad"
               />
-
               <SettingNumber
                 label="Fuerza de la patada (%)"
-                value={String(Math.round(settings.kickStrength * 100))}
-                onChange={(txt) =>
-                  setSettings((s) => ({
-                    ...s,
-                    kickStrength: clamp(toNum(txt, s.kickStrength * 100), 0, 100) / 100,
-                  }))
-                }
+                value={draft.kickStrengthPercent}
+                onChange={(txt) => setDraft((d) => ({ ...d, kickStrengthPercent: txt }))}
                 suffix="%"
+                keyboard="decimal-pad"
               />
-
               <SettingNumber
                 label="Fuerza de la explosión (%)"
-                value={String(Math.round(settings.explodeStrength * 100))}
-                onChange={(txt) =>
-                  setSettings((s) => ({
-                    ...s,
-                    explodeStrength: clamp(toNum(txt, s.explodeStrength * 100), 0, 100) / 100,
-                  }))
-                }
+                value={draft.explodeStrengthPercent}
+                onChange={(txt) => setDraft((d) => ({ ...d, explodeStrengthPercent: txt }))}
                 suffix="%"
+                keyboard="decimal-pad"
               />
 
-              {/* Botón de reset motor */}
+              {/* Botones acción */}
+              <TouchableOpacity style={styles.applyBtn} onPress={applyDraft}>
+                <Text style={styles.applyBtnText}>Aplicar cambios</Text>
+              </TouchableOpacity>
+
               <TouchableOpacity style={styles.resetBtn} onPress={resetEngine}>
                 <Text style={styles.resetBtnText}>Reiniciar motor</Text>
               </TouchableOpacity>
@@ -1303,11 +1327,13 @@ function SettingNumber({
   value,
   onChange,
   suffix,
+  keyboard = "numeric",
 }: {
   label: string;
   value: string;
   onChange: (txt: string) => void;
   suffix?: string;
+  keyboard?: "numeric" | "number-pad" | "decimal-pad";
 }) {
   return (
     <View style={styles.settingRow}>
@@ -1315,7 +1341,7 @@ function SettingNumber({
       <View style={styles.settingInputWrap}>
         <TextInput
           style={styles.settingInput}
-          keyboardType="numeric"
+          keyboardType={keyboard}
           value={value}
           onChangeText={onChange}
           placeholder=""
@@ -1418,12 +1444,23 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.15,
     shadowRadius: 4,
     shadowOffset: { width: 0, height: 1 },
+    position: "relative",
   },
   progressFill: {
     height: "100%",
     backgroundColor: "#60a5fa",
     borderTopRightRadius: BAR_R,
     borderBottomRightRadius: BAR_R,
+  },
+  // Marca de recuperación de regresión
+  regressionMark: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    width: 2,
+    backgroundColor: "#ef4444",
+    zIndex: 2,
+    transform: [{ translateX: -1 }],
   },
 
   // Pulso rojo durante REGRESIÓN
@@ -1525,13 +1562,30 @@ const styles = StyleSheet.create({
   },
   settingsBtnText: { color: "#e2e8f0", fontSize: 16 },
 
+  // Toast
+  toast: {
+    position: "absolute",
+    bottom: 14,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+    zIndex: 25,
+  },
+  toastText: {
+    backgroundColor: "rgba(15,23,42,0.9)",
+    color: "#e5e7eb",
+    borderColor: "#334155",
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 999,
+    overflow: "hidden",
+  },
+
   // Modal ajustes
   modalBackdrop: {
     position: "absolute",
-    left: 0,
-    right: 0,
-    top: 0,
-    bottom: 0,
+    left: 0, right: 0, top: 0, bottom: 0,
     backgroundColor: "rgba(0,0,0,0.6)",
     alignItems: "center",
     justifyContent: "center",
@@ -1564,10 +1618,7 @@ const styles = StyleSheet.create({
     paddingTop: 10,
   },
 
-  settingRow: {
-    marginBottom: 12,
-    gap: 6,
-  },
+  settingRow: { marginBottom: 12, gap: 6 },
   settingLabel: { color: "#cbd5e1", fontSize: 14, fontWeight: "600" },
   settingInputWrap: {
     flexDirection: "row",
@@ -1588,8 +1639,19 @@ const styles = StyleSheet.create({
   },
   settingSuffix: { color: "#94a3b8", fontSize: 14, marginLeft: 8 },
 
-  resetBtn: {
+  applyBtn: {
     marginTop: 6,
+    backgroundColor: "#0ea5e9",
+    borderColor: "#0284c7",
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: "center",
+  },
+  applyBtnText: { color: "#082f49", fontSize: 16, fontWeight: "800" },
+
+  resetBtn: {
+    marginTop: 10,
     backgroundColor: "#1e293b",
     borderColor: "#475569",
     borderWidth: 1,
