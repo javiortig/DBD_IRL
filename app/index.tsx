@@ -3,10 +3,11 @@
 // Regresión + chispazos (Gen_Spark1..9) 5–7s sin reparar.
 // Multitouch fluido, audio por tramos, completed loop+notif, landscape.
 // Hover centrado, patada con cooldown y tick, Skill Checks estilo DBD (timers separados).
-// Menú de AJUSTES (popup) con borrador editable y botón “Aplicar cambios”. Reset de motor sin tocar ajustes.
+// Menú de AJUSTES (popup) con borrador editable y botón “Aplicar cambios” + Reset del motor.
 // BLOQUEO: no permite reparar ni toques, pero SÍ deja que la regresión avance.
-// Toast propio (multiplataforma) para confirmar acciones.
+// Toast multiplataforma para confirmar acciones.
 // Marca de umbral de recuperación durante la regresión.
+// Import/Export de ajustes con CÓDIGO CORTO (26 chars, 0–9 A–Z, todo MAYÚSCULAS) en un ÚNICO CAMPO.
 
 import { Audio } from "expo-av";
 import * as Haptics from "expo-haptics";
@@ -84,35 +85,35 @@ const SFX = {
   good: require("../assets/sfx/Good_Skill_Check.wav"),
 } as const;
 
-type TrackKey = keyof typeof SFX;
+type SfxKey = keyof typeof SFX;
 type SkillState = "NONE" | "RELEASE" | "AIM_PENDING" | "AIM_ACTIVE";
 
 // ===== AJUSTES =====
 type Settings = {
-  maxPlayers: number;                 // MAX_PLAYERS
-  soloSeconds: number;                // SOLO_SECONDS (s)
-  maxPlayerPenalty: number;           // MAX_PLAYER_REPAIR_PENALTY
-  kickCooldownMs: number;             // KICK_COOLDOWN_MS (ms)
-  blockKickMs: number;                // BLOQUEO por patada
-  blockExplodeMs: number;             // BLOQUEO por explosión
-  blockDropMs: number;                // BLOQUEO por abandono
-  regressionSpeedMult: number;        // REGRESSION_SPEED_MULT
-  regressionRecoverAmount: number;    // +X (0.06 = 6%)
-  skillMinS: number;                  // skill min (s) desde que empiezan a reparar
-  skillMaxS: number;                  // skill max (s)
-  kickStrength: number;               // % progreso que quita la patada (0.20 = 20%)
-  explodeStrength: number;            // % progreso que quita la explosión (0.10 = 10%)
+  maxPlayers: number;                 // 1..4
+  soloSeconds: number;                // 30..1000 step 10
+  maxPlayerPenalty: number;           // 0..1 step 0.01
+  kickCooldownMs: number;             // 1..100 s
+  blockKickMs: number;                // 1..100 s
+  blockExplodeMs: number;             // 1..100 s
+  blockDropMs: number;                // 1..100 s
+  regressionSpeedMult: number;        // 0.1..2 step 0.1
+  regressionRecoverAmount: number;    // 1..20 % (0.01..0.20)
+  skillMinS: number;                  // 1..100 s
+  skillMaxS: number;                  // 1..100 s (>= min)
+  kickStrength: number;               // 1..50 % (0.01..0.50)
+  explodeStrength: number;            // 1..50 % (0.01..0.50)
 };
 
-// >>> Valores predeterminados ACTUALIZADOS <<<
+// >>> Valores predeterminados <<<
 const DEFAULT_SETTINGS: Settings = {
   maxPlayers: 4,
   soloSeconds: 240,
   maxPlayerPenalty: 0.5,
-  kickCooldownMs: 25000,
-  blockKickMs: 20000,
-  blockExplodeMs: 8000,
-  blockDropMs: 5000,
+  kickCooldownMs: 25_000,
+  blockKickMs: 20_000,
+  blockExplodeMs: 8_000,
+  blockDropMs: 5_000,
   regressionSpeedMult: 0.5,
   regressionRecoverAmount: 0.06,
   skillMinS: 15,
@@ -121,7 +122,7 @@ const DEFAULT_SETTINGS: Settings = {
   explodeStrength: 0.1,
 };
 
-// Borrador (strings, permiten vacío)
+// Borrador (strings)
 type SettingsDraft = {
   maxPlayers: string;
   soloSeconds: string;
@@ -171,26 +172,26 @@ function settingsToDraft(s: Settings): SettingsDraft {
   };
 }
 function draftToSettings(d: SettingsDraft, current: Settings): Settings {
-  // Usa 'current' como fallback para vacíos
-  let maxPlayers = clamp(toInt(d.maxPlayers, current.maxPlayers), 1, 8);
-  let soloSeconds = clamp(toInt(d.soloSeconds, current.soloSeconds), 5, 600);
-  let maxPlayerPenalty = clamp(toNum(d.maxPlayerPenalty, current.maxPlayerPenalty), 0, 2);
+  // Rango y cuantización solicitada
+  let maxPlayers = clamp(toInt(d.maxPlayers, current.maxPlayers), 1, 4);
+  let soloSeconds = clamp(Math.round(toInt(d.soloSeconds, current.soloSeconds) / 10) * 10, 30, 1000);
+  let maxPlayerPenalty = clamp(Math.round(toNum(d.maxPlayerPenalty, current.maxPlayerPenalty) * 100) / 100, 0, 1);
 
-  let kickCooldownMs = clamp(toInt(d.kickCooldownS, Math.round(current.kickCooldownMs / 1000)), 0, 600) * 1000;
-  let blockKickMs = clamp(toInt(d.blockKickS, Math.round(current.blockKickMs / 1000)), 0, 600) * 1000;
-  let blockExplodeMs = clamp(toInt(d.blockExplodeS, Math.round(current.blockExplodeMs / 1000)), 0, 600) * 1000;
-  let blockDropMs = clamp(toInt(d.blockDropS, Math.round(current.blockDropMs / 1000)), 0, 600) * 1000;
+  let kickCooldownMs = clamp(toInt(d.kickCooldownS, Math.round(current.kickCooldownMs / 1000)), 1, 100) * 1000;
+  let blockKickMs = clamp(toInt(d.blockKickS, Math.round(current.blockKickMs / 1000)), 1, 100) * 1000;
+  let blockExplodeMs = clamp(toInt(d.blockExplodeS, Math.round(current.blockExplodeMs / 1000)), 1, 100) * 1000;
+  let blockDropMs = clamp(toInt(d.blockDropS, Math.round(current.blockDropMs / 1000)), 1, 100) * 1000;
 
-  let regressionSpeedMult = clamp(toNum(d.regressionSpeedMult, current.regressionSpeedMult), 0, 5);
+  let regressionSpeedMult = clamp(Math.round(toNum(d.regressionSpeedMult, current.regressionSpeedMult) * 10) / 10, 0.1, 2);
   let regressionRecoverAmount =
-    clamp(toNum(d.regressionRecoverPercent, current.regressionRecoverAmount * 100), 0, 100) / 100;
+    clamp(toInt(d.regressionRecoverPercent, Math.round(current.regressionRecoverAmount * 100)), 1, 20) / 100;
 
-  let skillMinS = clamp(toInt(d.skillMinS, current.skillMinS), 1, 600);
-  let skillMaxS = clamp(toInt(d.skillMaxS, current.skillMaxS), 1, 600);
+  let skillMinS = clamp(toInt(d.skillMinS, current.skillMinS), 1, 100);
+  let skillMaxS = clamp(toInt(d.skillMaxS, current.skillMaxS), 1, 100);
   if (skillMaxS < skillMinS) skillMaxS = skillMinS;
 
-  let kickStrength = clamp(toNum(d.kickStrengthPercent, current.kickStrength * 100), 0, 100) / 100;
-  let explodeStrength = clamp(toNum(d.explodeStrengthPercent, current.explodeStrength * 100), 0, 100) / 100;
+  let kickStrength = clamp(toInt(d.kickStrengthPercent, Math.round(current.kickStrength * 100)), 1, 50) / 100;
+  let explodeStrength = clamp(toInt(d.explodeStrengthPercent, Math.round(current.explodeStrength * 100)), 1, 50) / 100;
 
   return {
     maxPlayers,
@@ -219,9 +220,136 @@ async function fadeVolume(sound: Audio.Sound, from: number, to: number, ms: numb
   }
 }
 
+// ======= CÓDIGO CORTO (EXPORT/IMPORT) =======
+// 13 campos * 2 chars base36 (0–9A–Z) = 26 caracteres.
+const ABC = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const enc2 = (n: number) => ABC[Math.floor(n / 36)] + ABC[n % 36];
+const dec2 = (a: string, i: number) => {
+  const c1 = ABC.indexOf(a[i] || "");
+  const c2 = ABC.indexOf(a[i + 1] || "");
+  if (c1 < 0 || c2 < 0) return NaN;
+  return c1 * 36 + c2;
+};
+
+// Definición de cuantización
+const Q = {
+  MAX_PLAYERS: { base: 1, step: 1, count: 4 },                    // idx 0..3
+  SOLO_SECONDS: { base: 30, step: 10, count: 98 },                // 30..1000
+  PENALTY: { base: 0, step: 0.01, count: 101 },                   // 0..1
+  KC_S: { base: 1, step: 1, count: 100 },                         // 1..100
+  BK_S: { base: 1, step: 1, count: 100 },
+  BE_S: { base: 1, step: 1, count: 100 },
+  BD_S: { base: 1, step: 1, count: 100 },
+  REG_MULT: { base: 0.1, step: 0.1, count: 20 },                  // 0.1..2.0
+  REG_REC_PCT: { base: 1, step: 1, count: 20 },                   // 1..20
+  SK_MIN: { base: 1, step: 1, count: 100 },
+  SK_MAX: { base: 1, step: 1, count: 100 },
+  KICK_PCT: { base: 1, step: 1, count: 50 },                      // 1..50
+  EXP_PCT: { base: 1, step: 1, count: 50 },                       // 1..50
+} as const;
+
+function toIdx(val: number, base: number, step: number, count: number) {
+  const raw = Math.round((val - base) / step);
+  return clamp(raw, 0, count - 1);
+}
+function idxVal(idx: number, base: number, step: number) {
+  return base + idx * step;
+}
+
+function draftToIndices(d: SettingsDraft, current: Settings) {
+  const s = draftToSettings(d, current);
+  const idx = {
+    A: toIdx(s.maxPlayers, Q.MAX_PLAYERS.base, Q.MAX_PLAYERS.step, Q.MAX_PLAYERS.count),
+    B: toIdx(s.soloSeconds, Q.SOLO_SECONDS.base, Q.SOLO_SECONDS.step, Q.SOLO_SECONDS.count),
+    C: toIdx(s.maxPlayerPenalty, Q.PENALTY.base, Q.PENALTY.step, Q.PENALTY.count),
+    D: toIdx(Math.round(s.kickCooldownMs / 1000), Q.KC_S.base, Q.KC_S.step, Q.KC_S.count),
+    E: toIdx(Math.round(s.blockKickMs / 1000), Q.BK_S.base, Q.BK_S.step, Q.BK_S.count),
+    F: toIdx(Math.round(s.blockExplodeMs / 1000), Q.BE_S.base, Q.BE_S.step, Q.BE_S.count),
+    G: toIdx(Math.round(s.blockDropMs / 1000), Q.BD_S.base, Q.BD_S.step, Q.BD_S.count),
+    H: toIdx(s.regressionSpeedMult, Q.REG_MULT.base, Q.REG_MULT.step, Q.REG_MULT.count),
+    I: toIdx(Math.round(s.regressionRecoverAmount * 100), Q.REG_REC_PCT.base, Q.REG_REC_PCT.step, Q.REG_REC_PCT.count),
+    J: toIdx(s.skillMinS, Q.SK_MIN.base, Q.SK_MIN.step, Q.SK_MIN.count),
+    K: toIdx(s.skillMaxS, Q.SK_MAX.base, Q.SK_MAX.step, Q.SK_MAX.count),
+    L: toIdx(Math.round(s.kickStrength * 100), Q.KICK_PCT.base, Q.KICK_PCT.step, Q.KICK_PCT.count),
+    M: toIdx(Math.round(s.explodeStrength * 100), Q.EXP_PCT.base, Q.EXP_PCT.step, Q.EXP_PCT.count),
+  };
+  // Forzar SK_MAX >= SK_MIN a nivel de índices
+  const minV = idxVal(idx.J, Q.SK_MIN.base, Q.SK_MIN.step);
+  let maxI = idx.K;
+  let maxV = idxVal(maxI, Q.SK_MAX.base, Q.SK_MAX.step);
+  if (maxV < minV) {
+    maxV = minV;
+    maxI = toIdx(maxV, Q.SK_MAX.base, Q.SK_MAX.step, Q.SK_MAX.count);
+  }
+  idx.K = maxI;
+  return idx;
+}
+
+function indicesToCode(idx: ReturnType<typeof draftToIndices>) {
+  return (
+    enc2(idx.A) + enc2(idx.B) + enc2(idx.C) + enc2(idx.D) + enc2(idx.E) + enc2(idx.F) +
+    enc2(idx.G) + enc2(idx.H) + enc2(idx.I) + enc2(idx.J) + enc2(idx.K) + enc2(idx.L) + enc2(idx.M)
+  );
+}
+
+function codeToDraft(code: string): SettingsDraft | null {
+  if (!code || code.length !== 26) return null;
+  const v = (i: number) => dec2(code, i);
+  const A = v(0),  B = v(2),  C = v(4),  D = v(6),  E = v(8),  F = v(10), G = v(12);
+  const H = v(14), I = v(16), J = v(18), K = v(20), L = v(22), M = v(24);
+  const bad =
+    [A,B,C,D,E,F,G,H,I,J,K,L,M].some((x) => Number.isNaN(x)) ||
+    A >= Q.MAX_PLAYERS.count ||
+    B >= Q.SOLO_SECONDS.count ||
+    C >= Q.PENALTY.count ||
+    D >= Q.KC_S.count ||
+    E >= Q.BK_S.count ||
+    F >= Q.BE_S.count ||
+    G >= Q.BD_S.count ||
+    H >= Q.REG_MULT.count ||
+    I >= Q.REG_REC_PCT.count ||
+    J >= Q.SK_MIN.count ||
+    K >= Q.SK_MAX.count ||
+    L >= Q.KICK_PCT.count ||
+    M >= Q.EXP_PCT.count;
+  if (bad) return null;
+
+  const maxPlayers = idxVal(A, Q.MAX_PLAYERS.base, Q.MAX_PLAYERS.step);
+  const soloSeconds = idxVal(B, Q.SOLO_SECONDS.base, Q.SOLO_SECONDS.step);
+  const maxPlayerPenalty = idxVal(C, Q.PENALTY.base, Q.PENALTY.step);
+  const kickCooldownS = idxVal(D, Q.KC_S.base, Q.KC_S.step);
+  const blockKickS = idxVal(E, Q.BK_S.base, Q.BK_S.step);
+  const blockExplodeS = idxVal(F, Q.BE_S.base, Q.BE_S.step);
+  const blockDropS = idxVal(G, Q.BD_S.base, Q.BD_S.step);
+  const regressionSpeedMult = idxVal(H, Q.REG_MULT.base, Q.REG_MULT.step);
+  const regressionRecoverPercent = idxVal(I, Q.REG_REC_PCT.base, Q.REG_REC_PCT.step);
+  const skillMinS = idxVal(J, Q.SK_MIN.base, Q.SK_MIN.step);
+  let skillMaxS = idxVal(K, Q.SK_MAX.base, Q.SK_MAX.step);
+  if (skillMaxS < skillMinS) skillMaxS = skillMinS;
+  const kickStrengthPercent = idxVal(L, Q.KICK_PCT.base, Q.KICK_PCT.step);
+  const explodeStrengthPercent = idxVal(M, Q.EXP_PCT.base, Q.EXP_PCT.step);
+
+  const floatStr = (n: number) => (Math.round(n * 100) / 100).toString();
+
+  return {
+    maxPlayers: String(maxPlayers),
+    soloSeconds: String(soloSeconds),
+    maxPlayerPenalty: floatStr(maxPlayerPenalty),
+    kickCooldownS: String(kickCooldownS),
+    blockKickS: String(blockKickS),
+    blockExplodeS: String(blockExplodeS),
+    blockDropS: String(blockDropS),
+    regressionSpeedMult: floatStr(regressionSpeedMult),
+    regressionRecoverPercent: String(regressionRecoverPercent),
+    skillMinS: String(skillMinS),
+    skillMaxS: String(skillMaxS),
+    kickStrengthPercent: String(kickStrengthPercent),
+    explodeStrengthPercent: String(explodeStrengthPercent),
+  };
+}
+
 export default function Engine() {
   useKeepAwake();
-
   useEffect(() => {
     ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE).catch(() => {});
   }, []);
@@ -240,28 +368,56 @@ export default function Engine() {
   const settingsRef = useRef<Settings>(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
-  // Borrador de ajustes para el popup
+  // Borrador + popup
   const [draft, setDraft] = useState<SettingsDraft>(settingsToDraft(DEFAULT_SETTINGS));
   const [showSettings, setShowSettings] = useState(false);
-  useEffect(() => {
-    if (showSettings) {
-      setDraft(settingsToDraft(settingsRef.current));
-    }
-  }, [showSettings]);
 
+  // Progreso / toques / completo
   const [progress, setProgress] = useState(0);
   const [playersTouching, setPlayersTouching] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
   const [touchPoints, setTouchPoints] = useState<{ id: number; x: number; y: number }[]>([]);
+
+  // Barra px para marca de regresión
+  const [barWidth, setBarWidth] = useState(0);
+
+  // Código ÚNICO (se sincroniza con el borrador si el campo está “en sync”)
+  const initialAuto = indicesToCode(draftToIndices(settingsToDraft(DEFAULT_SETTINGS), DEFAULT_SETTINGS));
+  const [code, setCode] = useState<string>(initialAuto);
+  const lastAutoCodeRef = useRef<string>(initialAuto);
+
+  useEffect(() => {
+    if (showSettings) {
+      const d = settingsToDraft(settingsRef.current);
+      setDraft(d);
+      // Al abrir, sincronizamos el campo de código con el borrador
+      const auto = indicesToCode(draftToIndices(d, settingsRef.current));
+      setCode(auto);
+      lastAutoCodeRef.current = auto;
+    }
+  }, [showSettings]);
+
+  // Recalcular código cuando cambia el borrador.
+  // Para NO pisar un pegado manual, solo actualizamos si el campo está en sync
+  // (igual al último código autogenerado).
+  useEffect(() => {
+    const auto = indicesToCode(draftToIndices(draft, settingsRef.current));
+    if (code === lastAutoCodeRef.current) {
+      setCode(auto);
+      lastAutoCodeRef.current = auto;
+    } else {
+      // El usuario ha tecleado algo: no sobreescribimos.
+      lastAutoCodeRef.current = auto; // guardamos el nuevo auto para futura comparación
+    }
+  }, [draft]);
 
   const applyDraft = async () => {
     const next = draftToSettings(draft, settingsRef.current);
     setSettings(next);
     try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); } catch {}
     showToast("Ajustes aplicados");
-    setShowSettings(false); // <- cerrar popup al aplicar
+    setShowSettings(false); // cerrar popup
 
-    // Si ahora mismo están reparando y se puede programar skill, re-arma el temporizador
     if (
       !isComplete &&
       !isBlocked() &&
@@ -294,8 +450,8 @@ export default function Engine() {
   }, [regressionActive]);
 
   // Audio
-  const soundsRef = useRef<Partial<Record<TrackKey, Audio.Sound>>>({});
-  const currentKeyRef = useRef<TrackKey | null>(null);
+  const soundsRef = useRef<Partial<Record<SfxKey, Audio.Sound>>>({});
+  const currentKeyRef = useRef<SfxKey | null>(null);
   const currentRef = useRef<Audio.Sound | null>(null);
   const stoppingRef = useRef(false);
 
@@ -353,7 +509,7 @@ export default function Engine() {
     let mounted = true;
     (async () => {
       try {
-        for (const key of Object.keys(SFX) as TrackKey[]) {
+        for (const key of Object.keys(SFX) as SfxKey[]) {
           if (!mounted) break;
           if (soundsRef.current[key]) continue;
           const { sound } = await Audio.Sound.createAsync(SFX[key], { shouldPlay: false, volume: VOL });
@@ -466,10 +622,9 @@ export default function Engine() {
 
     if (repairingPrev && !repairingNow) {
       clearSkillScheduler();
-      // Bloqueo por drop SOLO si no venimos de skill y no estamos en ventana de gracia
+      // Bloqueo por drop SOLO si no venimos de skill y no estamos en gracia
       if (skillStateRef.current === "NONE" && !isComplete && Date.now() >= ignoreDropUntilRef.current) {
         setBlocked(settingsRef.current.blockDropMs);
-        showToast("Bloqueado por abandono");
       }
       return;
     }
@@ -528,7 +683,7 @@ export default function Engine() {
         if (regressionActiveRef.current && effectivePlayers > 0) {
           if (regressionRecoverBaselineRef.current === null) {
             regressionRecoverBaselineRef.current = next;
-          } else if (next >= regressionRecoverBaselineRef.current + 0.000001 + st.regressionRecoverAmount) {
+          } else if (next >= (regressionRecoverBaselineRef.current + st.regressionRecoverAmount + 0.000001)) {
             regressionActiveRef.current = false;
             setRegressionActive(false);
             regressionRecoverBaselineRef.current = null;
@@ -545,6 +700,17 @@ export default function Engine() {
     rafRef.current = requestAnimationFrame(loop);
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [playersTouching, isComplete]);
+
+  const playCompletedNotificationOnce = async () => {
+    const s = soundsRef.current.completedNotif;
+    if (!s) return;
+    try {
+      await s.setIsLoopingAsync(false);
+      await s.setVolumeAsync(VOL);
+      await s.setPositionAsync(0);
+      await s.playAsync();
+    } catch {}
+  };
 
   const triggerComplete = async () => {
     setIsComplete(true);
@@ -603,18 +769,7 @@ export default function Engine() {
     if (offTimerRef.current) { clearTimeout(offTimerRef.current); offTimerRef.current = null; }
   };
 
-  const playCompletedNotificationOnce = async () => {
-    const s = soundsRef.current.completedNotif;
-    if (!s) return;
-    try {
-      await s.setIsLoopingAsync(false);
-      await s.setVolumeAsync(VOL);
-      await s.setPositionAsync(0);
-      await s.playAsync();
-    } catch {}
-  };
-
-  const chooseLoopTrack = (p: number, repairing: boolean): TrackKey | null => {
+  const chooseLoopTrack = (p: number, repairing: boolean): SfxKey | null => {
     if (p <= 0) return null;
     if (p > 0 && p <= 0.25) return repairing ? "gen1Repair" : "gen1";
     if (p > 0.25 && p <= 0.5) return repairing ? "gen2Repair" : "gen2";
@@ -642,7 +797,7 @@ export default function Engine() {
     })().catch(() => {});
   }, [progress, repairingSmooth, isComplete]);
 
-  const crossfadeTo = async (key: TrackKey | null) => {
+  const crossfadeTo = async (key: SfxKey | null) => {
     try {
       const now = Date.now();
       if (currentKeyRef.current !== key && now - lastSwitchRef.current < MIN_TRACK_HOLD_MS) return;
@@ -786,7 +941,7 @@ export default function Engine() {
     }
   };
 
-  const playOnce = async (key: TrackKey) => {
+  const playOnce = async (key: SfxKey) => {
     const s = soundsRef.current[key];
     if (!s) return;
     try {
@@ -803,7 +958,8 @@ export default function Engine() {
 
   const onKickStart = () => {
     if (isComplete) return;
-    if (isKickOnCooldown() || skillStateRef.current !== "NONE" || isBlocked()) return;
+    // ⬇️ YA NO SE BLOQUEA POR isBlocked(); solo cooldown/skill
+    if (isKickOnCooldown() || skillStateRef.current !== "NONE") return;
     if (kickAnimatingRef.current) return;
 
     kickAnimatingRef.current = true;
@@ -812,7 +968,8 @@ export default function Engine() {
 
     const step = () => {
       if (!kickAnimatingRef.current) return;
-      if (isKickOnCooldown() || skillStateRef.current !== "NONE" || isBlocked()) {
+      // ⬇️ Sin bloqueo por isBlocked() en mitad de la carga
+      if (isKickOnCooldown() || skillStateRef.current !== "NONE") {
         kickReset();
         return;
       }
@@ -838,7 +995,6 @@ export default function Engine() {
         regressionRecoverBaselineRef.current = null;
 
         setBlocked(settingsRef.current.blockKickMs);
-        showToast("Bloqueado por patada");
 
         nextKickAtRef.current = Date.now() + settingsRef.current.kickCooldownMs;
         setKickCooldownLeftMs(settingsRef.current.kickCooldownMs);
@@ -872,7 +1028,7 @@ export default function Engine() {
     sparkTimeoutRef.current = setTimeout(async () => {
       if (!isComplete && regressionActiveRef.current && playersTouchingRef.current === 0) {
         const idx = 1 + Math.floor(Math.random() * 9);
-        const key = `spark${idx}` as TrackKey;
+        const key = `spark${idx}` as SfxKey;
         playOnce(key).catch(() => {});
       }
       scheduleNextSpark();
@@ -976,7 +1132,6 @@ export default function Engine() {
     setRegressionActive(true);
     regressionRecoverBaselineRef.current = null;
     setBlocked(settingsRef.current.blockExplodeMs);
-    showToast("Bloqueado por explosión");
   };
 
   // ===== Reset motor (sin tocar ajustes) =====
@@ -1006,7 +1161,7 @@ export default function Engine() {
     currentRef.current = null;
     currentKeyRef.current = null;
 
-    setShowSettings(false); // <- cerrar popup al reiniciar
+    setShowSettings(false);
     showToast("Motor reiniciado");
   };
 
@@ -1015,17 +1170,17 @@ export default function Engine() {
   // Cooldown patada
   const cooldownSec = kickCooldownLeftMs / 1000;
   const cooldownLabel = cooldownSec > 0 ? `${cooldownSec.toFixed(1)}s` : "Listo";
-  const kickAreaDisabled = isComplete || cooldownSec > 0 || skillState !== "NONE" || isBlocked();
+  // ⬇️ La patada ya NO se deshabilita por bloqueo del motor
+  const kickAreaDisabled = isComplete || cooldownSec > 0 || skillState !== "NONE";
 
   const blockedSec = Math.ceil(blockedLeftMs / 1000);
 
   // ==== MARCA DE UMBRAL DE RECUPERACIÓN (regresión) ====
-  // Se muestra mientras HAY regresión y los jugadores han empezado a reparar de nuevo.
-  let recoverMarkLeftPct: string | null = null;
-  if (regressionActive && playersTouching > 0) {
+  let recoverMarkLeftPx: number | null = null;
+  if (regressionActive && playersTouching > 0 && barWidth > 0) {
     const base = regressionRecoverBaselineRef.current ?? progress;
     const thr = Math.min(1, base + settingsRef.current.regressionRecoverAmount);
-    recoverMarkLeftPct = `${thr * 100}%`;
+    recoverMarkLeftPx = Math.round(barWidth * thr);
   }
 
   // ===== UI =====
@@ -1128,14 +1283,13 @@ export default function Engine() {
                 styles.progressBar,
                 regressionActive && (regPulse ? styles.progressBarRegA : styles.progressBarRegB),
               ]}
+              onLayout={(e) => setBarWidth(e.nativeEvent.layout.width)}
               renderToHardwareTextureAndroid
               needsOffscreenAlphaCompositing
             >
               <View style={[styles.progressFill, { width: `${percent}%` }]} />
-
-              {/* Marca de umbral para quitar regresión */}
-              {recoverMarkLeftPct && (
-                <View style={[styles.regressionMark, { left: recoverMarkLeftPct }]} />
+              {recoverMarkLeftPx != null && (
+                <View style={[styles.regressionMark, { left: recoverMarkLeftPx }]} />
               )}
             </View>
 
@@ -1175,7 +1329,7 @@ export default function Engine() {
         <View
           style={[
             styles.kickArea,
-            (isComplete || cooldownSec > 0 || skillState !== "NONE" || isBlocked()) && styles.kickDisabled,
+            (isComplete || cooldownSec > 0 || skillState !== "NONE") && styles.kickDisabled,
           ]}
           onStartShouldSetResponder={() => !kickAreaDisabled}
           onMoveShouldSetResponder={() => !kickAreaDisabled}
@@ -1191,8 +1345,6 @@ export default function Engine() {
               ? `Espera ${cooldownLabel}`
               : skillState !== "NONE"
               ? "Bloqueado por skill"
-              : isBlocked()
-              ? "Bloqueado…"
               : "Mantén 3s"}
           </Text>
 
@@ -1219,7 +1371,6 @@ export default function Engine() {
                 label="Número máximo de jugadores"
                 value={draft.maxPlayers}
                 onChange={(txt) => setDraft((d) => ({ ...d, maxPlayers: txt }))}
-                suffix=""
                 keyboard="number-pad"
               />
               <SettingNumber
@@ -1274,7 +1425,7 @@ export default function Engine() {
                 value={draft.regressionRecoverPercent}
                 onChange={(txt) => setDraft((d) => ({ ...d, regressionRecoverPercent: txt }))}
                 suffix="%"
-                keyboard="decimal-pad"
+                keyboard="number-pad"
               />
               <SettingNumber
                 label="Skillcheck: tiempo mínimo (s)"
@@ -1295,15 +1446,54 @@ export default function Engine() {
                 value={draft.kickStrengthPercent}
                 onChange={(txt) => setDraft((d) => ({ ...d, kickStrengthPercent: txt }))}
                 suffix="%"
-                keyboard="decimal-pad"
+                keyboard="number-pad"
               />
               <SettingNumber
                 label="Fuerza de la explosión (%)"
                 value={draft.explodeStrengthPercent}
                 onChange={(txt) => setDraft((d) => ({ ...d, explodeStrengthPercent: txt }))}
                 suffix="%"
-                keyboard="decimal-pad"
+                keyboard="number-pad"
               />
+
+              {/* Campo ÚNICO de CÓDIGO + Importar */}
+              <View style={{ height: 10 }} />
+              <Text style={styles.settingLabel}>Código de ajustes</Text>
+              <View style={styles.settingInputWrap}>
+                <TextInput
+                  style={styles.settingInput}
+                  value={code}
+                  onChangeText={(txt) => {
+                    const up = txt.toUpperCase().replace(/[^0-9A-Z]/g, "").slice(0, 26);
+                    setCode(up);
+                  }}
+                  placeholder="PEGAR O COPIAR DESDE AQUÍ"
+                  placeholderTextColor="#64748b"
+                  autoCapitalize="characters"
+                />
+              </View>
+              <TouchableOpacity
+                style={styles.applyBtn}
+                onPress={() => {
+                  const normalized = code.toUpperCase().replace(/[^0-9A-Z]/g, "");
+                  if (normalized.length !== 26) {
+                    showToast("Código inválido");
+                    return;
+                  }
+                  const d = codeToDraft(normalized);
+                  if (!d) {
+                    showToast("Código inválido");
+                    return;
+                  }
+                  setDraft(d);
+                  const canonical = indicesToCode(draftToIndices(d, settingsRef.current));
+                  setCode(canonical);
+                  lastAutoCodeRef.current = canonical;
+                  showToast("Código importado");
+                }}
+              >
+                <Text style={styles.applyBtnText}>Importar cambios</Text>
+              </TouchableOpacity>
 
               {/* Botones acción */}
               <TouchableOpacity style={styles.applyBtn} onPress={applyDraft}>
@@ -1452,7 +1642,6 @@ const styles = StyleSheet.create({
     borderTopRightRadius: BAR_R,
     borderBottomRightRadius: BAR_R,
   },
-  // Marca de recuperación de regresión
   regressionMark: {
     position: "absolute",
     top: 0,
@@ -1609,7 +1798,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     paddingHorizontal: 4,
   },
-  modalTitle: { color: "#e5e7eb", fontSize: 18, fontWeight: "800", letterSpacing: 0.5 },
+  modalTitle: { color: "#e5e7eb", fontSize: 18, fontWeight: "800" },
   modalClose: { color: "#94a3b8", fontSize: 20, padding: 6 },
 
   modalScroll: {
@@ -1640,7 +1829,7 @@ const styles = StyleSheet.create({
   settingSuffix: { color: "#94a3b8", fontSize: 14, marginLeft: 8 },
 
   applyBtn: {
-    marginTop: 6,
+    marginTop: 10,
     backgroundColor: "#0ea5e9",
     borderColor: "#0284c7",
     borderWidth: 1,
